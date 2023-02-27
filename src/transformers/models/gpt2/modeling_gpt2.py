@@ -134,6 +134,7 @@ class GPT2Attention(nn.Module):
         max_positions = config.max_position_embeddings
         self.register_buffer(
             "bias",
+            # 下三角矩阵
             torch.tril(torch.ones((max_positions, max_positions), dtype=torch.uint8)).view(
                 1, 1, max_positions, max_positions
             ),
@@ -150,12 +151,15 @@ class GPT2Attention(nn.Module):
                 f" {self.num_heads})."
             )
 
+        # Default is True
         self.scale_attn_weights = config.scale_attn_weights
         self.is_cross_attention = is_cross_attention
 
         # Layer-wise attention scaling, reordering, and upcasting
+        # Default is False
         self.scale_attn_by_inverse_layer_idx = config.scale_attn_by_inverse_layer_idx
         self.layer_idx = layer_idx
+        # Default is False
         self.reorder_and_upcast_attn = config.reorder_and_upcast_attn
 
         if self.is_cross_attention:
@@ -345,6 +349,7 @@ class GPT2Attention(nn.Module):
 class GPT2MLP(nn.Module):
     def __init__(self, intermediate_size, config):
         super().__init__()
+
         embed_dim = config.hidden_size
         self.c_fc = Conv1D(intermediate_size, embed_dim)
         self.c_proj = Conv1D(embed_dim, intermediate_size)
@@ -356,12 +361,14 @@ class GPT2MLP(nn.Module):
         hidden_states = self.act(hidden_states)
         hidden_states = self.c_proj(hidden_states)
         hidden_states = self.dropout(hidden_states)
+
         return hidden_states
 
 
 class GPT2Block(nn.Module):
     def __init__(self, config, layer_idx=None):
         super().__init__()
+
         hidden_size = config.hidden_size
         inner_dim = config.n_inner if config.n_inner is not None else 4 * hidden_size
 
@@ -408,6 +415,7 @@ class GPT2Block(nn.Module):
                     f"If `encoder_hidden_states` are passed, {self} has to be instantiated with "
                     "cross-attention layers by setting `config.add_cross_attention=True`"
                 )
+            
             residual = hidden_states
             hidden_states = self.ln_cross_attn(hidden_states)
             cross_attn_outputs = self.crossattention(
@@ -790,6 +798,7 @@ class GPT2Model(GPT2PreTrainedModel):
             past_key_values = tuple([None] * len(self.h))
         else:
             past_length = past_key_values[0][0].size(-2)
+
         if position_ids is None:
             position_ids = torch.arange(past_length, input_shape[-1] + past_length, dtype=torch.long, device=device)
             position_ids = position_ids.unsqueeze(0).view(-1, input_shape[-1])
@@ -848,11 +857,12 @@ class GPT2Model(GPT2PreTrainedModel):
         all_self_attentions = () if output_attentions else None
         all_cross_attentions = () if output_attentions and self.config.add_cross_attention else None
         all_hidden_states = () if output_hidden_states else None
-        for i, (block, layer_past) in enumerate(zip(self.h, past_key_values)):
 
+        for i, (block, layer_past) in enumerate(zip(self.h, past_key_values)):
             # Model parallel
             if self.model_parallel:
                 torch.cuda.set_device(hidden_states.device)
+
                 # Ensure layer_past is on same device as hidden_states (might not be correct)
                 if layer_past is not None:
                     layer_past = tuple(past_state.to(hidden_states.device) for past_state in layer_past)
@@ -861,11 +871,11 @@ class GPT2Model(GPT2PreTrainedModel):
                     attention_mask = attention_mask.to(hidden_states.device)
                 if isinstance(head_mask, torch.Tensor):
                     head_mask = head_mask.to(hidden_states.device)
+
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
 
             if self.gradient_checkpointing and self.training:
-
                 if use_cache:
                     logger.warning(
                         "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`..."
@@ -901,9 +911,9 @@ class GPT2Model(GPT2PreTrainedModel):
                 )
 
             hidden_states = outputs[0]
+
             if use_cache is True:
                 presents = presents + (outputs[1],)
-
             if output_attentions:
                 all_self_attentions = all_self_attentions + (outputs[2 if use_cache else 1],)
                 if self.config.add_cross_attention:
@@ -916,7 +926,6 @@ class GPT2Model(GPT2PreTrainedModel):
                         hidden_states = hidden_states.to("cuda:" + str(k + 1))
 
         hidden_states = self.ln_f(hidden_states)
-
         hidden_states = hidden_states.view(output_shape)
         # Add last hidden state
         if output_hidden_states:
