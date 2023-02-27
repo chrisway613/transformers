@@ -720,6 +720,7 @@ class GPT2Model(GPT2PreTrainedModel):
         for index in range(len(self.h)):
             self.h[index] = self.h[index].to("cpu")
         self.ln_f = self.ln_f.to("cpu")
+        
         torch.cuda.empty_cache()
 
     def get_input_embeddings(self):
@@ -949,6 +950,7 @@ class GPT2LMHeadModel(GPT2PreTrainedModel):
 
     def __init__(self, config):
         super().__init__(config)
+
         self.transformer = GPT2Model(config)
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
@@ -966,7 +968,9 @@ class GPT2LMHeadModel(GPT2PreTrainedModel):
             if device_map is None
             else device_map
         )
+        # Checking if duplicated, missing or extra modules that device mapped existed.
         assert_device_map(self.device_map, len(self.transformer.h))
+
         self.transformer.parallelize(self.device_map)
         self.lm_head = self.lm_head.to(self.transformer.first_device)
         self.model_parallel = True
@@ -974,9 +978,11 @@ class GPT2LMHeadModel(GPT2PreTrainedModel):
     @add_start_docstrings(DEPARALLELIZE_DOCSTRING)
     def deparallelize(self):
         self.transformer.deparallelize()
+
         self.transformer = self.transformer.to("cpu")
         self.lm_head = self.lm_head.to("cpu")
         self.model_parallel = False
+
         torch.cuda.empty_cache()
 
     def get_output_embeddings(self):
@@ -1074,6 +1080,7 @@ class GPT2LMHeadModel(GPT2PreTrainedModel):
             # Shift so that tokens < n predict n
             shift_logits = lm_logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
+
             # Flatten the tokens
             loss_fct = CrossEntropyLoss()
             loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
