@@ -76,6 +76,12 @@ def parse_args():
         help="The name of the dataset to use (via the datasets library).",
     )
     parser.add_argument(
+        "--data_cache_dir",
+        type=str,
+        default=None,
+        help="Directory of the dataset to be cached.",
+    )
+    parser.add_argument(
         "--dataset_config_name",
         type=str,
         default=None,
@@ -98,6 +104,12 @@ def parse_args():
         "--model_name_or_path",
         type=str,
         help="Path to pretrained model or model identifier from huggingface.co/models.",
+    )
+    parser.add_argument(
+        "--model_cache_dir",
+        type=str,
+        default=None,
+        help="Directory of model weights to be cached."
     )
     parser.add_argument(
         "--config_name",
@@ -288,17 +300,19 @@ def main():
     # download the dataset.
     if args.dataset_name is not None:
         # Downloading and loading a dataset from the hub.
-        raw_datasets = load_dataset(args.dataset_name, args.dataset_config_name)
+        raw_datasets = load_dataset(args.dataset_name, args.dataset_config_name, cache_dir=args.data_cache_dir)
         if "validation" not in raw_datasets.keys():
             raw_datasets["validation"] = load_dataset(
                 args.dataset_name,
                 args.dataset_config_name,
                 split=f"train[:{args.validation_split_percentage}%]",
+                cache_dir=args.data_cache_dir
             )
             raw_datasets["train"] = load_dataset(
                 args.dataset_name,
                 args.dataset_config_name,
                 split=f"train[{args.validation_split_percentage}%:]",
+                cache_dir=args.data_cache_dir
             )
     else:
         data_files = {}
@@ -338,17 +352,17 @@ def main():
     # In distributed training, the .from_pretrained methods guarantee that only one local process can concurrently
     # download model & vocab.
     if args.config_name:
-        config = AutoConfig.from_pretrained(args.config_name)
+        config = AutoConfig.from_pretrained(args.config_name, cache_dir=args.model_cache_dir, cache_dir=args.model_cache_dir)
     elif args.model_name_or_path:
-        config = AutoConfig.from_pretrained(args.model_name_or_path)
+        config = AutoConfig.from_pretrained(args.model_name_or_path, cache_dir=args.model_cache_dir, cache_dir=args.model_cache_dir)
     else:
         config = CONFIG_MAPPING[args.model_type]()
         logger.warning("You are instantiating a new config instance from scratch.")
 
     if args.tokenizer_name:
-        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name, use_fast=not args.use_slow_tokenizer)
+        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name, use_fast=not args.use_slow_tokenizer, cache_dir=args.model_cache_dir)
     elif args.model_name_or_path:
-        tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, use_fast=not args.use_slow_tokenizer)
+        tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, use_fast=not args.use_slow_tokenizer, cache_dir=args.model_cache_dir)
     else:
         raise ValueError(
             "You are instantiating a new tokenizer from scratch. This is not supported by this script."
@@ -360,6 +374,7 @@ def main():
             args.model_name_or_path,
             from_tf=bool(".ckpt" in args.model_name_or_path),
             config=config,
+            cache_dir=args.model_cache_dir
         )
     else:
         logger.info("Training new model from scratch")

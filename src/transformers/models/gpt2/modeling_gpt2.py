@@ -134,7 +134,7 @@ class GPT2Attention(nn.Module):
         max_positions = config.max_position_embeddings
         self.register_buffer(
             "bias",
-            # 下三角矩阵
+            # Lower triangular matrix
             torch.tril(torch.ones((max_positions, max_positions), dtype=torch.uint8)).view(
                 1, 1, max_positions, max_positions
             ),
@@ -193,9 +193,10 @@ class GPT2Attention(nn.Module):
         attn_weights = torch.matmul(query, key.transpose(-1, -2))
 
         if self.scale_attn_weights:
-            attn_weights = attn_weights / (value.size(-1) ** 0.5)
+            attn_weights = attn_weights / (value.size(-1) ** 0.5)  # / sqrt(d)
 
         # Layer-wise attention scaling
+        # TODO: motivation?
         if self.scale_attn_by_inverse_layer_idx:
             attn_weights = attn_weights / float(self.layer_idx + 1)
 
@@ -210,11 +211,9 @@ class GPT2Attention(nn.Module):
             attn_weights = attn_weights + attention_mask
 
         attn_weights = nn.functional.softmax(attn_weights, dim=-1)
-
         # Downcast (if necessary) back to V's dtype (if in mixed-precision) -- No-Op otherwise
         attn_weights = attn_weights.type(value.dtype)
         attn_weights = self.attn_dropout(attn_weights)
-
         # Mask heads if we want to
         if head_mask is not None:
             attn_weights = attn_weights * head_mask
@@ -277,19 +276,19 @@ class GPT2Attention(nn.Module):
         return attn_output, attn_weights
 
     def _split_heads(self, tensor, num_heads, attn_head_size):
-        """
-        Splits hidden_size dim into attn_head_size and num_heads
-        """
+        """ Splits hidden_size dim into attn_head_size and num_heads. """
+
         new_shape = tensor.size()[:-1] + (num_heads, attn_head_size)
         tensor = tensor.view(new_shape)
+
         return tensor.permute(0, 2, 1, 3)  # (batch, head, seq_length, head_features)
 
     def _merge_heads(self, tensor, num_heads, attn_head_size):
-        """
-        Merges attn_head_size dim and num_attn_heads dim into hidden_size
-        """
+        """ Merges attn_head_size dim and num_attn_heads dim into hidden_size. """
+
         tensor = tensor.permute(0, 2, 1, 3).contiguous()
         new_shape = tensor.size()[:-2] + (num_heads * attn_head_size,)
+        
         return tensor.view(new_shape)
 
     def forward(
@@ -322,6 +321,7 @@ class GPT2Attention(nn.Module):
 
         if layer_past is not None:
             past_key, past_value = layer_past
+            # Concat on the dim of seq length
             key = torch.cat((past_key, key), dim=-2)
             value = torch.cat((past_value, value), dim=-2)
 
@@ -1122,11 +1122,11 @@ class GPT2LMHeadModel(GPT2PreTrainedModel):
 
 @add_start_docstrings(
     """
-The GPT2 Model transformer with a language modeling and a multiple-choice classification head on top e.g. for
-RocStories/SWAG tasks. The two heads are two linear layers. The language modeling head has its weights tied to the
-input embeddings, the classification head takes as input the input of a specified classification token index in the
-input sequence).
-""",
+    The GPT2 Model transformer with a language modeling and a multiple-choice classification head on top e.g. for
+    RocStories/SWAG tasks. The two heads are two linear layers. The language modeling head has its weights tied to the
+    input embeddings, the classification head takes as input the input of a specified classification token index in the
+    input sequence).
+    """,
     GPT2_START_DOCSTRING,
 )
 class GPT2DoubleHeadsModel(GPT2PreTrainedModel):
@@ -1134,7 +1134,9 @@ class GPT2DoubleHeadsModel(GPT2PreTrainedModel):
 
     def __init__(self, config):
         super().__init__(config)
+
         config.num_labels = 1
+
         self.transformer = GPT2Model(config)
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         self.multiple_choice_head = SequenceSummary(config)
@@ -1154,6 +1156,7 @@ class GPT2DoubleHeadsModel(GPT2PreTrainedModel):
             else device_map
         )
         assert_device_map(self.device_map, len(self.transformer.h))
+
         self.transformer.parallelize(self.device_map)
         self.lm_head = self.lm_head.to(self.transformer.first_device)
         self.multiple_choice_head = self.multiple_choice_head.to(self.transformer.first_device)
@@ -1166,6 +1169,7 @@ class GPT2DoubleHeadsModel(GPT2PreTrainedModel):
         self.lm_head = self.lm_head.to("cpu")
         self.multiple_choice_head = self.multiple_choice_head.to("cpu")
         self.model_parallel = False
+
         torch.cuda.empty_cache()
 
     def get_output_embeddings(self):
@@ -1226,7 +1230,7 @@ class GPT2DoubleHeadsModel(GPT2PreTrainedModel):
         r"""
         mc_token_ids (`torch.LongTensor` of shape `(batch_size, num_choices)`, *optional*, default to index of the last token of the input):
             Index of the classification token in each input sequence. Selected in the range `[0, input_ids.size(-1) -
-            1[`.
+            1]`.
         labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
             Labels for language modeling. Note that the labels **are shifted** inside the model, i.e. you can set
             `labels = input_ids` Indices are selected in `[-100, 0, ..., config.vocab_size - 1]` All labels set to
@@ -1286,6 +1290,7 @@ class GPT2DoubleHeadsModel(GPT2PreTrainedModel):
             hidden_states = hidden_states.to(self.lm_head.weight.device)
 
         lm_logits = self.lm_head(hidden_states)
+        # (b,n_choices)
         mc_logits = self.multiple_choice_head(hidden_states, mc_token_ids).squeeze(-1)
 
         mc_loss = None
