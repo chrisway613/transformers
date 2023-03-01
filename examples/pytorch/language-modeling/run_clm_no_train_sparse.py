@@ -22,12 +22,15 @@ https://huggingface.co/models?filter=text-generation
 """
 # You can also adapt this script on your own causal language modeling task. Pointers for this are left as comments.
 
-import argparse
-import json
-import logging
-import math
 import os
+import math
+import glob
+import json
 import random
+import shutil
+import logging
+import argparse
+
 from itertools import chain
 from pathlib import Path
 
@@ -97,6 +100,18 @@ def parse_args():
         "--validation_split_percentage",
         default=5,
         help="The percentage of the train set used as validation set in case there's no validation split",
+    )
+    parser.add_argument(
+        "--max_train_samples",
+        type=int,
+        default=None,
+        help="For debugging purposes or quicker training, truncate the number of training examples to this value if set."
+    )
+    parser.add_argument(
+        "--max_eval_samples",
+        type=int,
+        default=None,
+        help="For debugging purposes or quicker training, truncate the number of evaluation examples to this value if set."
     )
 
     # Model
@@ -344,6 +359,13 @@ def main():
                 **dataset_args,
             )
 
+    if args.max_train_samples is not None:
+        max_train_samples = min(len(raw_datasets['train']), args.max_train_samples)
+        raw_datasets['train'] = raw_datasets['train'].select(range(max_train_samples))
+    if args.max_eval_samples is not None:
+        max_eval_samples = min(len(raw_datasets['validation']), args.max_eval_samples)
+        raw_datasets['validation'] = raw_datasets['validation'].select(range(max_eval_samples))
+
     # See more about loading any type of standard or custom dataset (from files, python dict, pandas DataFrame, etc) at
     # https://huggingface.co/docs/datasets/loading_datasets.html.
 
@@ -379,6 +401,7 @@ def main():
     else:
         logger.info("Training new model from scratch")
         model = AutoModelForCausalLM.from_config(config)
+    logger.info(f"\nModel structure:\n{model}\n")
 
     model.resize_token_embeddings(len(tokenizer))
 
@@ -452,8 +475,16 @@ def main():
             desc=f"Grouping texts in chunks of {block_size}",
         )
 
+    if args.max_train_samples is not None:
+        max_train_samples = min(len(lm_datasets['train']), args.max_train_samples)
+        lm_datasets['train'] = lm_datasets['train'].select(range(max_train_samples))
     train_dataset = lm_datasets["train"]
+
+    if args.max_eval_samples is not None:
+        max_eval_samples = min(len(lm_datasets['validation']), args.max_eval_samples)
+        lm_datasets['validation'] = lm_datasets['validation'].select(range(max_eval_samples))
     eval_dataset = lm_datasets["validation"]
+        
     # Log a few random samples from the training set:
     for index in random.sample(range(len(train_dataset)), 3):
         logger.info(f"Sample {index} of the training set: {train_dataset[index]}.")
@@ -462,13 +493,13 @@ def main():
     train_dataloader = DataLoader(
         train_dataset,
         shuffle=True,
-        pin_memorty=True, num_workers=4,
+        pin_memory=True, num_workers=8,
         collate_fn=default_data_collator,
         batch_size=args.per_device_train_batch_size
     )
     eval_dataloader = DataLoader(
         eval_dataset,
-        pin_memorty=True, num_workers=4,
+        pin_memory=True, num_workers=8,
         collate_fn=default_data_collator,
         batch_size=args.per_device_eval_batch_size
     )
@@ -568,6 +599,8 @@ def main():
             starting_epoch = resume_step // len(train_dataloader)
             resume_step -= starting_epoch * len(train_dataloader)
 
+    best_perplexity = float('inf')
+
     for epoch in range(starting_epoch, args.num_train_epochs):
         model.train()
 
@@ -647,6 +680,24 @@ def main():
             output_dir = f"epoch_{epoch}"
             if args.output_dir is not None:
                 output_dir = os.path.join(args.output_dir, output_dir)
+            accelerator.save_state(output_dir)
+        
+        # Save states when better performance acheived.  
+        if args.checkpointing_steps == "best" and perplexity < best_perplexity:
+            best_perplexity = perplexity
+            
+            pattn = "epoch*-ppl*"
+            output_dir = f"epoch_{epoch}-ppl_{perplexity:.3f}"
+            if args.output_dir is not None:
+                output_dir = os.path.join(args.output_dir, output_dir)
+                pattn = os.path.join(args.output_dir, pattn)
+            
+            # Delete previous best
+            if accelerator.is_main_process:
+                for prev_best in glob.glob(pattn):
+                    shutil.rmtree(prev_best)
+                    
+            accelerator.wait_for_everyone()
             accelerator.save_state(output_dir)
 
     if args.output_dir is not None:

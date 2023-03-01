@@ -22,12 +22,14 @@ https://huggingface.co/models?filter=text-generation
 """
 # You can also adapt this script on your own causal language modeling task. Pointers for this are left as comments.
 
-import argparse
-import json
-import logging
-import math
 import os
+import math
+import glob
+import json
 import random
+import shutil
+import logging
+import argparse
 
 from pathlib import Path
 from itertools import chain
@@ -69,6 +71,8 @@ MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Finetune a transformers model on a causal language modeling task")
+    
+    # Data
     parser.add_argument(
         "--dataset_name",
         type=str,
@@ -99,6 +103,20 @@ def parse_args():
         help="The percentage of the train set used as validation set in case there's no validation split",
     )
     parser.add_argument(
+        "--max_train_samples",
+        type=int,
+        default=None,
+        help="For debugging purposes or quicker training, truncate the number of training examples to this value if set."
+    )
+    parser.add_argument(
+        "--max_eval_samples",
+        type=int,
+        default=None,
+        help="For debugging purposes or quicker training, truncate the number of evaluation examples to this value if set."
+    )
+
+    # Model
+    parser.add_argument(
         "--model_name_or_path",
         type=str,
         help="Path to pretrained model or model identifier from huggingface.co/models.",
@@ -126,6 +144,8 @@ def parse_args():
         action="store_true",
         help="If passed, will use a slow tokenizer (not backed by the 🤗 Tokenizers library).",
     )
+
+    # Train
     parser.add_argument(
         "--per_device_train_batch_size",
         type=int,
@@ -168,6 +188,8 @@ def parse_args():
     parser.add_argument(
         "--num_warmup_steps", type=int, default=0, help="Number of steps for the warmup in the lr scheduler."
     )
+
+    # Global
     parser.add_argument("--output_dir", type=str, default=None, help="Where to store the final model.")
     parser.add_argument("--seed", type=int, default=None, help="A seed for reproducible training.")
     parser.add_argument(
@@ -221,6 +243,7 @@ def parse_args():
         action="store_true",
         help="Whether to load in all available experiment trackers from the environment and use them for logging.",
     )
+
     args = parser.parse_args()
 
     # Sanity checks
@@ -335,6 +358,13 @@ def main():
                 split=f"train[{args.validation_split_percentage}%:]",
                 **dataset_args,
             )
+    
+    if args.max_train_samples is not None:
+        max_train_samples = min(len(raw_datasets['train']), args.max_train_samples)
+        raw_datasets['train'] = raw_datasets['train'].select(range(max_train_samples))
+    if args.max_eval_samples is not None:
+        max_eval_samples = min(len(raw_datasets['validation']), args.max_eval_samples)
+        raw_datasets['validation'] = raw_datasets['validation'].select(range(max_eval_samples))
 
     # See more about loading any type of standard or custom dataset (from files, python dict, pandas DataFrame, etc) at
     # https://huggingface.co/docs/datasets/loading_datasets.html.
@@ -371,6 +401,7 @@ def main():
     else:
         logger.info("Training new model from scratch")
         model = AutoModelForCausalLM.from_config(config)
+    logger.info(f"\nModel structure:\n{model}\n")
 
     model.resize_token_embeddings(len(tokenizer))
 
@@ -441,7 +472,14 @@ def main():
             desc=f"Grouping texts in chunks of {block_size}",
         )
 
+    if args.max_train_samples is not None:
+        max_train_samples = min(len(lm_datasets['train']), args.max_train_samples)
+        lm_datasets['train'] = lm_datasets['train'].select(range(max_train_samples))
     train_dataset = lm_datasets["train"]
+
+    if args.max_eval_samples is not None:
+        max_eval_samples = min(len(lm_datasets['validation']), args.max_eval_samples)
+        lm_datasets['validation'] = lm_datasets['validation'].select(range(max_eval_samples))
     eval_dataset = lm_datasets["validation"]
 
     # Log a few random samples from the training set:
@@ -450,10 +488,17 @@ def main():
 
     # DataLoaders creation:
     train_dataloader = DataLoader(
-        train_dataset, shuffle=True, collate_fn=default_data_collator, batch_size=args.per_device_train_batch_size
+        train_dataset,
+        shuffle=True,
+        pin_memory=True, num_workers=8,
+        collate_fn=default_data_collator,
+        batch_size=args.per_device_train_batch_size
     )
     eval_dataloader = DataLoader(
-        eval_dataset, collate_fn=default_data_collator, batch_size=args.per_device_eval_batch_size
+        eval_dataset,
+        pin_memory=True, num_workers=8,
+        collate_fn=default_data_collator,
+        batch_size=args.per_device_eval_batch_size
     )
 
     # Optimizer
@@ -523,6 +568,7 @@ def main():
     logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
     logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
+
     # Only show the progress bar once on each machine.
     progress_bar = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process)
     completed_steps = 0
@@ -550,16 +596,21 @@ def main():
             starting_epoch = resume_step // len(train_dataloader)
             resume_step -= starting_epoch * len(train_dataloader)
 
+    best_perplexity = float("inf")
+
     for epoch in range(starting_epoch, args.num_train_epochs):
         model.train()
+
         if args.with_tracking:
             total_loss = 0
+
         for step, batch in enumerate(train_dataloader):
             # We need to skip steps until we reach the resumed step
             if args.resume_from_checkpoint and epoch == starting_epoch:
                 if resume_step is not None and step < resume_step:
                     completed_steps += 1
                     continue
+
             outputs = model(**batch)
             loss = outputs.loss
             # We keep track of the loss at each epoch
@@ -567,10 +618,18 @@ def main():
                 total_loss += loss.detach().float()
             loss = loss / args.gradient_accumulation_steps
             accelerator.backward(loss)
+
+            if step % (500 * args.gradient_accumulation_steps) == 0 or step == len(train_dataloader) - 1:
+                logger.info(
+                    f"\nEpoch[{epoch + 1}/{args.num_train_epochs}]\t"
+                    f"Loss {loss.item()}\tLr {optimizer.param_groups[0]['lr']}\n"
+                )
+
             if step % args.gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
+
                 progress_bar.update(1)
                 completed_steps += 1
 
@@ -580,10 +639,12 @@ def main():
                     if args.output_dir is not None:
                         output_dir = os.path.join(args.output_dir, output_dir)
                     accelerator.save_state(output_dir)
+
             if completed_steps >= args.max_train_steps:
                 break
 
         model.eval()
+
         losses = []
         for step, batch in enumerate(eval_dataloader):
             with torch.no_grad():
@@ -594,11 +655,11 @@ def main():
 
         losses = torch.cat(losses)
         losses = losses[: len(eval_dataset)]
+
         try:
             perplexity = math.exp(torch.mean(losses))
         except OverflowError:
             perplexity = float("inf")
-
         logger.info(f"epoch {epoch}: perplexity: {perplexity}")
 
         if args.with_tracking:
@@ -622,6 +683,24 @@ def main():
             output_dir = f"epoch_{epoch}"
             if args.output_dir is not None:
                 output_dir = os.path.join(args.output_dir, output_dir)
+            accelerator.save_state(output_dir)
+        
+        # Save states when better performance acheived.  
+        if args.checkpointing_steps == "best" and perplexity < best_perplexity:
+            best_perplexity = perplexity
+            
+            pattn = "epoch*-ppl*"
+            output_dir = f"epoch_{epoch}-ppl_{perplexity:.3f}"
+            if args.output_dir is not None:
+                output_dir = os.path.join(args.output_dir, output_dir)
+                pattn = os.path.join(args.output_dir, pattn)
+            
+            # Delete previous best
+            if accelerator.is_main_process:
+                for prev_best in glob.glob(pattn):
+                    shutil.rmtree(prev_best)
+
+            accelerator.wait_for_everyone()
             accelerator.save_state(output_dir)
 
     if args.output_dir is not None:
