@@ -358,7 +358,7 @@ def main():
                 split=f"train[{args.validation_split_percentage}%:]",
                 **dataset_args,
             )
-    
+        
     if args.max_train_samples is not None:
         max_train_samples = min(len(raw_datasets['train']), args.max_train_samples)
         raw_datasets['train'] = raw_datasets['train'].select(range(max_train_samples))
@@ -619,7 +619,7 @@ def main():
             loss = loss / args.gradient_accumulation_steps
             accelerator.backward(loss)
 
-            if step % (500 * args.gradient_accumulation_steps) == 0 or step == len(train_dataloader) - 1:
+            if step % (100 * args.gradient_accumulation_steps) == 0 or step == len(train_dataloader) - 1:
                 logger.info(
                     f"\nEpoch[{epoch + 1}/{args.num_train_epochs}]\t"
                     f"Loss {loss.item()}\tLr {optimizer.param_groups[0]['lr']}\n"

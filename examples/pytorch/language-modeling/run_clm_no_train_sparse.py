@@ -31,11 +31,15 @@ import shutil
 import logging
 import argparse
 
-from itertools import chain
 from pathlib import Path
+from copy import deepcopy
+from itertools import chain
 
 import datasets
+
 import torch
+import torch.nn.functional as F
+
 from datasets import load_dataset
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
@@ -66,6 +70,14 @@ require_version("datasets>=1.8.0", "To fix: pip install -r examples/pytorch/lang
 
 MODEL_CONFIG_CLASSES = list(MODEL_MAPPING.keys())
 MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
+
+# For pruning modules
+from fast_pruning.core.model_pruner import ModelPruner
+from fast_pruning.core.torch_data_collector import TorchDataCollector, restore_weight
+
+
+# Modules that keep dense
+PRUNE_IGNORES = ['lm_head']
 
 
 def parse_args():
@@ -242,6 +254,39 @@ def parse_args():
         action="store_true",
         help="Whether to load in all available experiment trackers from the environment and use them for logging.",
     )
+
+    # Prune
+    parser.add_argument(
+        "--prune_frequency",
+        type=int,
+        default=1000,
+        help="Pruning frequency, counted on number of steps."
+    )
+    parser.add_argument(
+        "--num_prune_samples",
+        type=int,
+        default=512,
+        help="Number of samples used for pruning."
+    )
+    parser.add_argument(
+        "--pruner_type",
+        type=str,
+        default="gcd",
+        help="The pruner type to use.",
+        choices=["gcd", "pcg"]
+    )
+    parser.add_argument(
+        "--sparsity",
+        type=float,
+        required=True,
+        help="Pruning sparsity."
+    )
+    parser.add_argument(
+        "--kd",
+        action="store_true",
+        help="Whether to perform knowledge distillation."
+    )
+
     args = parser.parse_args()
 
     # Sanity checks
@@ -259,6 +304,28 @@ def parse_args():
         assert args.output_dir is not None, "Need an `output_dir` to create a repo when `--push_to_hub` is passed."
 
     return args
+
+
+def criterion_for_kd(student_outputs, teacher_outputs):
+    student_hs, student_attns, student_logits = student_outputs.hidden_states, \
+        student_outputs.attentions, student_outputs.logits
+    teacher_hs, teacher_attns, teacher_logits = teacher_outputs.hidden_states, \
+        teacher_outputs.attentions, teacher_outputs.logits
+
+    # Loss for logits: soft ce loss
+    logit_loss = (F.softmax(teacher_logits, dim=-1) * -F.log_softmax(student_logits, dim=-1)).mean()
+
+    # Loss for hidden states: mse loss
+    hs_loss = 0.
+    for layer_stu_hs, layer_tea_hs in zip(student_hs, teacher_hs):
+        hs_loss = hs_loss + F.mse_loss(layer_stu_hs, layer_tea_hs)
+
+    # Loss for attentions: mse loss
+    attn_loss = 0.
+    for layer_stu_attn, layer_tea_attn in zip(student_attns, teacher_attns):
+        attn_loss = attn_loss + F.mse_loss(layer_stu_attn, layer_tea_attn)
+    
+    return logit_loss, hs_loss, attn_loss
 
 
 def main():
@@ -537,10 +604,14 @@ def main():
         num_training_steps=args.max_train_steps,
     )
 
-    # Prepare everything with our `accelerator`.
+    # Prepare everything with our `accelerator`
     model, optimizer, train_dataloader, eval_dataloader, lr_scheduler = accelerator.prepare(
         model, optimizer, train_dataloader, eval_dataloader, lr_scheduler
     )
+
+    if args.kd:
+        teacher = deepcopy(model)
+        teacher.eval()
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -614,13 +685,36 @@ def main():
                     completed_steps += 1
                     continue
 
+            if args.kd:
+                batch.update(output_attentions=True, output_hidden_states=True)
+                with torch.no_grad():
+                    teacher_outputs = teacher(**batch)
+
             outputs = model(**batch)
-            loss = outputs.loss
+            if args.kd:
+                logit_loss, hs_loss, attn_loss = criterion_for_kd(outputs, teacher_outputs)
+                loss = logit_loss + hs_loss + attn_loss
+            else:
+                loss = outputs.loss
             # We keep track of the loss at each epoch
             if args.with_tracking:
                 total_loss += loss.detach().float()
+
             loss = loss / args.gradient_accumulation_steps
             accelerator.backward(loss)
+
+            if step % (100 * args.gradient_accumulation_steps) == 0 or step == len(train_dataloader) - 1:
+                logger.info(
+                    f"\nEpoch[{epoch + 1}/{args.num_train_epochs}]\t"
+                    f"Loss {loss.item()}\tLr {optimizer.param_groups[0]['lr']}\t"
+                )
+                if args.kd:
+                    logger.info(
+                        f"Logit loss {logit_loss}\t"
+                        f"Hidden state loss {hs_loss}\t"
+                        f"Attention loss {attn_loss}"
+                    )
+                logger.info("\n")
 
             if step % args.gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
                 optimizer.step()
@@ -629,6 +723,65 @@ def main():
 
                 progress_bar.update(1)
                 completed_steps += 1
+            
+            # Few-shot pruning
+            if (step + 1) % args.prune_frequency == 0:
+                model.eval()
+
+                ''' i. Register forward hook for collecting states '''
+                collector = TorchDataCollector()
+                collector.register_hook_for_target_layer(model)
+
+                ''' ii. Forwarding on few-shot samples in order to record states 
+                        NOTE: gradient is not required '''
+                num_prune_samples = min(args.num_prune_samples, len(train_dataset))
+                prune_samples = train_dataset.select(range(num_prune_samples))
+                logger.info(f"Pruning model on {num_prune_samples} samples..")
+
+                prune_loss_avg = 0.
+                for sample in tqdm(prune_samples, disable=not accelerator.is_local_main_process):
+                    batch = {k: torch.tensor(v, device=model.device).unsqueeze(0) for k, v in sample.items()}
+                    with torch.no_grad():
+                        prune_outputs = model(**batch)
+                        prune_loss_avg += prune_outputs.loss.item()
+                prune_loss_avg /= len(prune_samples)
+
+                try:
+                    prune_perplexity = math.exp(prune_loss_avg)
+                except OverflowError:
+                    prune_perplexity = float("inf")
+                logger.info(f"[epoch {epoch}] prune perplexity: {prune_perplexity}")
+
+                ''' iii. Pruning '''
+                pruner = ModelPruner(pruner=args.pruner_type)
+                pruned_weights_dict = pruner.pruning(
+                    dataset=collector.create_pruning_dataset(),
+                    target_sparsity={}.fromkeys(PRUNE_IGNORES, 0.),
+                    default_sparsity=args.sparsity,
+                    finetune_freq=1
+                )
+
+                ''' iv. Restore pruned weights '''
+                for name, module in model.named_modules():
+                    if name not in pruned_weights_dict or name in ('lm_head', 'model.decoder.project_out', 'model.decoder.project_in'):
+                        continue
+
+                    restore_weight(module, pruned_weights_dict[name])
+                    sparsity = (module.weight.data.abs() <= 1e-10).mean().item()
+                    logger.info(f"Sparse weights restored in {name}, sparsity is {sparsity}")
+
+                ''' v. Remove hooks and free memories'''
+                collector.remove_hooks()
+
+                del collector
+                del prune_samples
+                del pruner
+                del pruned_weights_dict
+
+                torch.cuda.empty_cache()
+
+                model.train()
+                accelerator.wait_for_everyone()
 
             if isinstance(checkpointing_steps, int):
                 if completed_steps % checkpointing_steps == 0:
