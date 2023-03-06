@@ -257,10 +257,16 @@ def parse_args():
 
     # Prune
     parser.add_argument(
+        "--prune_times",
+        type=int,
+        required=True,
+        help="Number of pruning times."
+    )
+    parser.add_argument(
         "--prune_frequency",
         type=int,
-        default=1000,
-        help="Pruning frequency, counted on number of steps."
+        default=None,
+        help="Pruning interval, counted by number of steps."
     )
     parser.add_argument(
         "--num_prune_samples",
@@ -276,10 +282,10 @@ def parse_args():
         choices=["gcd", "pcg"]
     )
     parser.add_argument(
-        "--sparsity",
+        "--sparsity_per_pruning_step",
         type=float,
         required=True,
-        help="Pruning sparsity."
+        help="How many parameters will become 0 by each pruning time."
     )
     parser.add_argument(
         "--kd",
@@ -672,6 +678,9 @@ def main():
 
     best_perplexity = float('inf')
 
+    prune_counts = 0
+    args.prune_frequency = args.prune_frequency or (len(train_dataloader) // args.prune_times)
+
     for epoch in range(starting_epoch, args.num_train_epochs):
         model.train()
 
@@ -725,7 +734,7 @@ def main():
                 completed_steps += 1
             
             # Few-shot pruning
-            if (step + 1) % args.prune_frequency == 0:
+            if (step + 1) % args.prune_frequency == 0 and prune_counts < args.prune_times:
                 model.eval()
 
                 ''' i. Register forward hook for collecting states '''
@@ -754,21 +763,26 @@ def main():
 
                 ''' iii. Pruning '''
                 pruner = ModelPruner(pruner=args.pruner_type)
+                # str -> numpy
                 pruned_weights_dict = pruner.pruning(
                     dataset=collector.create_pruning_dataset(),
                     target_sparsity={}.fromkeys(PRUNE_IGNORES, 0.),
                     default_sparsity=args.sparsity,
                     finetune_freq=1
                 )
+                # Sparse mask(0|1)
+                sparse_mask_dict = {k: (v > 1e-10).astype('float') for k, v in pruned_weights_dict.items()}
 
                 ''' iv. Restore pruned weights '''
                 for name, module in model.named_modules():
-                    if name not in pruned_weights_dict or name in ('lm_head', 'model.decoder.project_out', 'model.decoder.project_in'):
+                    if name not in pruned_weights_dict:
                         continue
 
                     restore_weight(module, pruned_weights_dict[name])
                     sparsity = (module.weight.data.abs() <= 1e-10).mean().item()
                     logger.info(f"Sparse weights restored in {name}, sparsity is {sparsity}")
+    
+                prune_counts += 1
 
                 ''' v. Remove hooks and free memories'''
                 collector.remove_hooks()
@@ -782,6 +796,9 @@ def main():
 
                 model.train()
                 accelerator.wait_for_everyone()
+            elif prune_counts:
+                # TODO: apply mask to model.
+                pass
 
             if isinstance(checkpointing_steps, int):
                 if completed_steps % checkpointing_steps == 0:
