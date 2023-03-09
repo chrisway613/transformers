@@ -141,6 +141,12 @@ def parse_args():
         help="Directory of model weights to be cached."
     )
     parser.add_argument(
+        "--ckpt",
+        type=str,
+        default=None,
+        help="Path to model checkpoint."
+    )
+    parser.add_argument(
         "--ckpt_dir",
         type=str,
         default=None,
@@ -493,6 +499,18 @@ def main():
     logger.info(f"\nModel structure:\n{model}\n")
     model.resize_token_embeddings(len(tokenizer))
 
+    if args.ckpt:
+        logger.info(f"Loading model checkpoint '{args.ckpt}'..")
+
+        state_dict = torch.load(args.ckpt, map_location='cpu')
+        missing_keys, unexpected_keys = model.load_state_dict(state_dict)
+        if len(missing_keys) and accelerator.is_local_main_process:
+            logger.warning(f"Missing keys: {missing_keys}")
+        if len(unexpected_keys) and accelerator.is_local_main_process:
+            logger.warning(f"Unexpected keys: {unexpected_keys}")
+        
+        logger.info("Model checkpoint loading done!")
+
     if args.ckpt_dir and accelerator.distributed_type == DistributedType.DEEPSPEED:
         from deepspeed.utils.zero_to_fp32 import get_fp32_state_dict_from_zero_checkpoint
 
@@ -723,6 +741,9 @@ def main():
     args.num_prune_samples = min(args.num_prune_samples, len(train_dataset))
     args.prune_frequency = args.prune_frequency or (0.8 * len(train_dataloader) // args.prune_times)
 
+    # Whether to keep mask applying to model if it was pruned.
+    keep_mask = True
+
     for epoch in range(starting_epoch, args.num_train_epochs):
         model.train()
 
@@ -772,7 +793,7 @@ def main():
                 lr_scheduler.step()
                 optimizer.zero_grad()
 
-                if prune_counts:
+                if prune_counts and keep_mask:
                     # Keep current sparsity
                     apply_mask(unwrapped_model, sparse_mask_dict)
 
@@ -861,8 +882,8 @@ def main():
                 model.train()
                 accelerator.wait_for_everyone()
             
-            # Eval every 1000 steps
-            if (step + 1) % (250 * args.gradient_accumulation_steps) == 0:
+            # Eval every 1000 steps if model has been pruned
+            if prune_counts and (step + 1) % (30 * args.gradient_accumulation_steps) == 0:
                 model.eval()
 
                 losses = []
