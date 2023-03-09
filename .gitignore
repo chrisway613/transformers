@@ -141,6 +141,8 @@ runs
 /examples/runs
 /examples/**/*.args
 /examples/rag/sweep
+/examples/*/*/gpt*
+/examples/*/*/gpt*
 
 # data
 /data

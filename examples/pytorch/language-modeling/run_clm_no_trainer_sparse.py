@@ -35,6 +35,7 @@ import argparse
 from pathlib import Path
 from copy import deepcopy
 from itertools import chain
+from datetime import timedelta
 
 import datasets
 
@@ -46,9 +47,9 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
 import transformers
-from accelerate import Accelerator, DistributedType
+from accelerate import Accelerator, DistributedType, InitProcessGroupKwargs
 from accelerate.logging import get_logger
-from accelerate.utils import set_seed
+from accelerate.utils import set_seed, MODEL_NAME
 from huggingface_hub import Repository
 from transformers import (
     CONFIG_MAPPING,
@@ -138,6 +139,12 @@ def parse_args():
         type=str,
         default=None,
         help="Directory of model weights to be cached."
+    )
+    parser.add_argument(
+        "--ckpt_dir",
+        type=str,
+        default=None,
+        help="Directory of model checkpoint."
     )
     parser.add_argument(
         "--config_name",
@@ -346,7 +353,9 @@ def main():
 
     # Initialize the accelerator. We will let the accelerator handle device placement for us in this example.
     # If we're using tracking, we also need to initialize it here and it will pick up all supported trackers in the environment
-    accelerator = Accelerator(log_with="all", logging_dir=args.output_dir) if args.with_tracking else Accelerator()
+    init_kwargs = [InitProcessGroupKwargs(timeout=timedelta(seconds=180000))]
+    accelerator = Accelerator(log_with="all", logging_dir=args.output_dir, kwargs_handlers=init_kwargs) \
+        if args.with_tracking else Accelerator(kwargs_handlers=init_kwargs)
     
     # Make one log on every process with the configuration for debugging.
     logging.basicConfig(
@@ -482,8 +491,28 @@ def main():
         logger.info("Training new model from scratch")
         model = AutoModelForCausalLM.from_config(config)
     logger.info(f"\nModel structure:\n{model}\n")
-
     model.resize_token_embeddings(len(tokenizer))
+
+    if args.ckpt_dir and accelerator.distributed_type == DistributedType.DEEPSPEED:
+        from deepspeed.utils.zero_to_fp32 import get_fp32_state_dict_from_zero_checkpoint
+
+        dev = model.device
+        fp32_state_dict = get_fp32_state_dict_from_zero_checkpoint(args.ckpt_dir, tag=MODEL_NAME)
+
+        logger.info(f"Loading model checkpoint from {args.ckpt_dir}..")
+        missing_keys, unexpected_keys = model.to('cpu', non_blocking=True).load_state_dict(fp32_state_dict, strict=False)
+        if len(missing_keys) and accelerator.is_local_main_process:
+            logger.warning(f"Missing keys: {missing_keys}")
+        if len(unexpected_keys) and accelerator.is_local_main_process:
+            logger.warning(f"Unexpected keys: {unexpected_keys}")
+
+        model.to(dev)
+        del fp32_state_dict
+
+        logger.info("Model checkpoint loading done!")
+    
+    if args.kd:
+        teacher = deepcopy(model)
 
     # Preprocessing the datasets.
     # First we tokenize all the texts.
@@ -624,7 +653,11 @@ def main():
     unwrapped_model = accelerator.unwrap_model(model)
 
     if args.kd:
-        teacher = deepcopy(model)
+        if accelerator.distributed_type == DistributedType.DEEPSPEED and accelerator.deepspeed_config["zero_optimization"]["stage"] == 2:
+            import deepspeed
+            teacher = deepspeed.init_inference(teacher)
+        else:
+            teacher = accelerator.prepare(teacher)
         teacher.eval()
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
@@ -688,7 +721,7 @@ def main():
 
     prune_counts, sparse_mask_dict = 0, {}
     args.num_prune_samples = min(args.num_prune_samples, len(train_dataset))
-    args.prune_frequency = args.prune_frequency or (len(train_dataloader) // args.prune_times)
+    args.prune_frequency = args.prune_frequency or (0.8 * len(train_dataloader) // args.prune_times)
 
     for epoch in range(starting_epoch, args.num_train_epochs):
         model.train()
@@ -745,7 +778,7 @@ def main():
 
                 progress_bar.update(1)
                 completed_steps += 1
-            
+
             # Few-shot pruning
             if (step + 1) % args.prune_frequency == 0 and prune_counts < args.prune_times:
                 model.eval()
@@ -754,7 +787,7 @@ def main():
 
                 ''' i. Register forward hook for collecting states '''
                 collector = TorchDataCollector()
-                collector.register_hook_for_layer(unwrapped_model)
+                collector.register_hook_for_layer(unwrapped_model, verbose=True)
 
                 ''' ii. Forwarding on few-shot samples in order to record states 
                         NOTE: gradient is not required '''
@@ -765,11 +798,12 @@ def main():
                     collate_fn=default_data_collator,
                     batch_size=args.per_device_eval_batch_size
                 )
+
                 logger.info(f"Prune frequency = {args.prune_frequency}")
                 logger.info(f"Num prune steps = {args.num_steps_per_pruning}")
                 logger.info(f"Num prune samples = {args.num_prune_samples}")
 
-                # for sample in tqdm(prune_samples, disable=not accelerator.is_local_main_process):
+                logger.info(f"Model forwarding on pruning data..")
                 for prune_step, prune_batch in tqdm(
                     enumerate(prune_dataloader, start=1),
                     disable=not accelerator.is_local_main_process
@@ -781,28 +815,32 @@ def main():
                     
                     if prune_step == args.num_steps_per_pruning:
                         break
+                logger.info("Done!\n")
 
                 ''' iii. Pruning '''
+                logger.info("Pruning model by solver..")
                 pruner = ModelPruner(pruner=args.pruner_type)
                 # str -> numpy
                 pruned_weights_dict, sparse_mask_dict = pruner.pruning(
                     dataset=collector.create_pruning_dataset(),
                     target_sparsity_dict={}.fromkeys(PRUNE_IGNORES, 0.),
                     default_sparsity=args.sparsity_per_pruning_step,
-                    finetune_freq=1,
-                    return_mask=True
+                    finetune_freq=1, return_mask=True, verbose=False
                 )
+                logger.info("Done!\n")
 
                 ''' iv. Restore pruned weights & apply mask'''
+                logger.info("Restoring sparse weights..")
                 for name, module in unwrapped_model.named_modules():
                     if name not in pruned_weights_dict:
                         continue
 
                     restore_weight(module, pruned_weights_dict[name])
                     sparsity = (module.weight.data.abs() <= 1e-10).mean().item()
-                    logger.info(f"Sparse weights already restored in {name}, sparsity is: {sparsity}")
+                    logger.info(f"layer: {name}\t sparsity: {sparsity}")
 
                 apply_mask(unwrapped_model, sparse_mask_dict)
+                logger.info("Done!\n")
                 
                 prune_counts += 1
                 prune_end = time.time()
@@ -822,6 +860,29 @@ def main():
 
                 model.train()
                 accelerator.wait_for_everyone()
+            
+            # Eval every 1000 steps
+            if (step + 1) % (250 * args.gradient_accumulation_steps) == 0:
+                model.eval()
+
+                losses = []
+                for step, batch in enumerate(eval_dataloader):
+                    with torch.no_grad():
+                        outputs = model(**batch)
+
+                    loss = outputs.loss
+                    # (num_devices*batch_size,)
+                    losses.append(accelerator.gather(loss.repeat(args.per_device_eval_batch_size)))
+                losses = torch.cat(losses)
+                losses = losses[: len(eval_dataset)]
+
+                try:
+                    perplexity = math.exp(torch.mean(losses))
+                except OverflowError:
+                    perplexity = float("inf")
+                logger.info(f"epoch {epoch} step: {step + 1} perplexity: {perplexity}\n")
+
+                model.train()
 
             if isinstance(checkpointing_steps, int):
                 if completed_steps % checkpointing_steps == 0:
@@ -850,7 +911,7 @@ def main():
             perplexity = math.exp(torch.mean(losses))
         except OverflowError:
             perplexity = float("inf")
-        logger.info(f"epoch {epoch}: perplexity: {perplexity}")
+        logger.info(f"epoch {epoch}: perplexity: {perplexity}\n")
 
         if args.with_tracking:
             accelerator.log(
