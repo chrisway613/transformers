@@ -143,6 +143,8 @@ runs
 /examples/rag/sweep
 /examples/*/*/gpt*
 /examples/*/*/gpt*
+/examples/*/*/*.sh
+/examples/*/*/*.log
 
 # data
 /data
