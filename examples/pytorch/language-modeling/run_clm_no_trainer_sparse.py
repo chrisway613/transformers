@@ -857,7 +857,7 @@ def main():
                         continue
 
                     restore_weight(module, pruned_weights_dict[name])
-                    sparsity = (module.weight.data.abs() <= 1e-10).mean().item()
+                    sparsity = (module.weight.abs() <= 1e-10).sum().item() / module.weight.numel()
                     logger.info(f"layer: {name}\t sparsity: {sparsity}")
 
                 apply_mask(unwrapped_model, sparse_mask_dict)
