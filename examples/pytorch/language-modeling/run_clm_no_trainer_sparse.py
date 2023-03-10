@@ -32,6 +32,8 @@ import shutil
 import logging
 import argparse
 
+import numpy as np
+
 from pathlib import Path
 from copy import deepcopy
 from itertools import chain
@@ -73,7 +75,7 @@ require_version("datasets>=1.8.0", "To fix: pip install -r examples/pytorch/lang
 MODEL_CONFIG_CLASSES = list(MODEL_MAPPING.keys())
 MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
 
-# For pruning modules
+# Pruning modules
 from fast_pruning.core.model_pruner import ModelPruner
 from fast_pruning.core.torch_data_collector import TorchDataCollector, restore_weight, apply_mask
 
@@ -297,9 +299,9 @@ def parse_args():
     parser.add_argument(
         "--pruner_type",
         type=str,
-        default="gcd",
+        default="obc",
         help="The pruner type to use.",
-        choices=["gcd", "pcg"]
+        choices=["obc", "gcd", "pcg"]
     )
     parser.add_argument(
         "--sparsity_per_pruning_step",
@@ -855,6 +857,10 @@ def main():
                 for name, module in unwrapped_model.named_modules():
                     if name not in pruned_weights_dict:
                         continue
+                        
+                    if np.sum(np.isnan(pruned_weights_dict[name])) > 0:
+                        logger.warning(f'WARN: pruned result of layer {name} contains nan, skip.')
+                        continue
 
                     restore_weight(module, pruned_weights_dict[name])
                     sparsity = (module.weight.abs() <= 1e-10).sum().item() / module.weight.numel()
@@ -865,7 +871,7 @@ def main():
                 
                 prune_counts += 1
                 prune_end = time.time()
-                logger.info(f"Pruning time used {prune_start - prune_end}s\n")
+                logger.info(f"Pruning time used {prune_end - prune_start}s\n")
 
                 ''' v. Remove hooks and free memories'''
                 collector.remove_hooks()
@@ -880,14 +886,15 @@ def main():
                 torch.cuda.empty_cache()
 
                 model.train()
-                accelerator.wait_for_everyone()
             
             # Eval every 1000 steps if model has been pruned
             if prune_counts and (step + 1) % (30 * args.gradient_accumulation_steps) == 0:
                 model.eval()
 
+                logger.info(f"Eval in epoch {epoch}, step{step + 1}..")
+
                 losses = []
-                for step, batch in enumerate(eval_dataloader):
+                for step, batch in tqdm(enumerate(eval_dataloader), disable=not accelerator.is_local_main_process):
                     with torch.no_grad():
                         outputs = model(**batch)
 
