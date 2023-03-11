@@ -737,6 +737,30 @@ def main():
             starting_epoch = resume_step // len(train_dataloader)
             resume_step -= starting_epoch * len(train_dataloader)
 
+    # Eval if checkpoint loaded.
+    if args.ckpt or (args.ckpt_dir and accelerator.distributed_type == DistributedType.DEEPSPEED):
+        model.eval()
+        logger.info("Eval for dense..")
+
+        losses = []
+        for batch in tqdm(eval_dataloader, disable=not accelerator.is_local_main_process):
+            with torch.no_grad():
+                outputs = model(**batch)
+
+            loss = outputs.loss
+            # (num_devices*batch_size,)
+            losses.append(accelerator.gather(loss.repeat(args.per_device_eval_batch_size)))
+        losses = torch.cat(losses)
+        losses = losses[: len(eval_dataset)]
+
+        try:
+            perplexity = math.exp(torch.mean(losses))
+        except OverflowError:
+            perplexity = float("inf")
+        logger.info(f"Done! Perplexity: {perplexity}\n")
+
+        del losses
+
     best_perplexity = float('inf')
 
     prune_counts, sparse_mask_dict = 0, {}
@@ -758,50 +782,7 @@ def main():
                 if resume_step is not None and step < resume_step:
                     completed_steps += 1
                     continue
-
-            if args.kd:
-                batch.update(output_attentions=True, output_hidden_states=True)
-                with torch.no_grad():
-                    teacher_outputs = teacher(**batch)
-
-            outputs = model(**batch)
-            if args.kd:
-                logit_loss, hs_loss, attn_loss = criterion_for_kd(outputs, teacher_outputs)
-                loss = logit_loss + hs_loss + attn_loss
-            else:
-                loss = outputs.loss
-            # We keep track of the loss at each epoch
-            if args.with_tracking:
-                total_loss += loss.detach().float()
-
-            loss = loss / args.gradient_accumulation_steps
-            accelerator.backward(loss)
-
-            if step % (100 * args.gradient_accumulation_steps) == 0 or step == len(train_dataloader) - 1:
-                logger.info(
-                    f"\nEpoch[{epoch + 1}/{args.num_train_epochs}]\t"
-                    f"Loss {loss.item()}\tLr {optimizer.param_groups[0]['lr']}\t"
-                )
-                if args.kd:
-                    logger.info(
-                        f"Logit loss {logit_loss}\t"
-                        f"Hidden state loss {hs_loss}\t"
-                        f"Attention loss {attn_loss}"
-                    )
-                logger.info("\n")
-
-            if step % args.gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
-                optimizer.step()
-                lr_scheduler.step()
-                optimizer.zero_grad()
-
-                if prune_counts and keep_mask:
-                    # Keep current sparsity
-                    apply_mask(unwrapped_model, sparse_mask_dict)
-
-                progress_bar.update(1)
-                completed_steps += 1
-
+            
             # Few-shot pruning
             if (step + 1) % args.prune_frequency == 0 and prune_counts < args.prune_times:
                 model.eval()
@@ -886,15 +867,57 @@ def main():
                 torch.cuda.empty_cache()
 
                 model.train()
-            
-            # Eval every 1000 steps if model has been pruned
-            if prune_counts and (step + 1) % (30 * args.gradient_accumulation_steps) == 0:
-                model.eval()
 
-                logger.info(f"Eval in epoch {epoch}, step{step + 1}..")
+            if args.kd:
+                batch.update(output_attentions=True, output_hidden_states=True)
+                with torch.no_grad():
+                    teacher_outputs = teacher(**batch)
+
+            outputs = model(**batch)
+            if args.kd:
+                logit_loss, hs_loss, attn_loss = criterion_for_kd(outputs, teacher_outputs)
+                loss = logit_loss + hs_loss + attn_loss
+            else:
+                loss = outputs.loss
+            # We keep track of the loss at each epoch
+            if args.with_tracking:
+                total_loss += loss.detach().float()
+
+            loss = loss / args.gradient_accumulation_steps
+            accelerator.backward(loss)
+
+            if step % (100 * args.gradient_accumulation_steps) == 0 or step == len(train_dataloader) - 1:
+                logger.info(
+                    f"\nEpoch[{epoch + 1}/{args.num_train_epochs}]\t"
+                    f"Loss {loss.item()}\tLr {optimizer.param_groups[0]['lr']}\t"
+                )
+                if args.kd:
+                    logger.info(
+                        f"Logit loss {logit_loss}\t"
+                        f"Hidden state loss {hs_loss}\t"
+                        f"Attention loss {attn_loss}"
+                    )
+                logger.info("\n")
+
+            if step % args.gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
+                optimizer.step()
+                lr_scheduler.step()
+                optimizer.zero_grad()
+
+                if prune_counts and keep_mask:
+                    # Keep current sparsity
+                    apply_mask(unwrapped_model, sparse_mask_dict)
+
+                progress_bar.update(1)
+                completed_steps += 1
+            
+            # Eval every 100 update steps if model has been pruned
+            if prune_counts and (step + 1) % (100 * args.gradient_accumulation_steps) == 0:
+                model.eval()
+                logger.info(f"Eval for sparse..")
 
                 losses = []
-                for step, batch in tqdm(enumerate(eval_dataloader), disable=not accelerator.is_local_main_process):
+                for batch in tqdm(eval_dataloader, disable=not accelerator.is_local_main_process):
                     with torch.no_grad():
                         outputs = model(**batch)
 
@@ -908,8 +931,9 @@ def main():
                     perplexity = math.exp(torch.mean(losses))
                 except OverflowError:
                     perplexity = float("inf")
-                logger.info(f"epoch {epoch} step: {step + 1} perplexity: {perplexity}\n")
+                logger.info(f"epoch: {epoch} step: {step + 1} perplexity: {perplexity}\n")
 
+                del losses
                 model.train()
 
             if isinstance(checkpointing_steps, int):
@@ -925,7 +949,7 @@ def main():
         model.eval()
 
         losses = []
-        for step, batch in enumerate(eval_dataloader):
+        for batch in eval_dataloader:
             with torch.no_grad():
                 outputs = model(**batch)
 
@@ -940,6 +964,8 @@ def main():
         except OverflowError:
             perplexity = float("inf")
         logger.info(f"epoch {epoch}: perplexity: {perplexity}\n")
+
+        del losses
 
         if args.with_tracking:
             accelerator.log(

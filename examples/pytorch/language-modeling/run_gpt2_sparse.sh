@@ -18,7 +18,7 @@ nohup accelerate launch run_clm_no_trainer_sparse.py \
     --num_train_epochs 1 \
     --checkpointing_steps best \
     --prune_times 1 \
-    --prune_frequency 3200 \
+    --prune_frequency 1 \
     --num_prune_samples 128 \
     --num_steps_per_pruning 64 \
     --sparsity_per_pruning_step 0.2 \
