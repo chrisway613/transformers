@@ -314,6 +314,11 @@ def parse_args():
         action="store_true",
         help="Whether to perform knowledge distillation."
     )
+    parser.add_argument(
+        "--eval_dense",
+        action="store_true",
+        help="Whether to do evaluation for dense."
+    )
 
     args = parser.parse_args()
 
@@ -710,6 +715,28 @@ def main():
     logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
 
+    def evaluation(model, dataloader):
+        model.eval()
+
+        losses = []
+        for batch in tqdm(dataloader, disable=not accelerator.is_local_main_process):
+            with torch.no_grad():
+                outputs = model(**batch)
+
+            loss = outputs.loss
+            # (num_devices*batch_size,)
+            losses.append(accelerator.gather(loss.repeat(args.per_device_eval_batch_size)))
+        losses = torch.cat(losses)
+        losses = losses[: len(eval_dataset)]
+
+        try:
+            perplexity = math.exp(torch.mean(losses))
+        except OverflowError:
+            perplexity = float("inf")
+
+        del losses
+        return perplexity
+
     # Only show the progress bar once on each machine.
     progress_bar = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process)
     completed_steps = 0
@@ -737,29 +764,12 @@ def main():
             starting_epoch = resume_step // len(train_dataloader)
             resume_step -= starting_epoch * len(train_dataloader)
 
-    # Eval if checkpoint loaded.
     if args.ckpt or (args.ckpt_dir and accelerator.distributed_type == DistributedType.DEEPSPEED):
-        model.eval()
-        logger.info("Eval for dense..")
-
-        losses = []
-        for batch in tqdm(eval_dataloader, disable=not accelerator.is_local_main_process):
-            with torch.no_grad():
-                outputs = model(**batch)
-
-            loss = outputs.loss
-            # (num_devices*batch_size,)
-            losses.append(accelerator.gather(loss.repeat(args.per_device_eval_batch_size)))
-        losses = torch.cat(losses)
-        losses = losses[: len(eval_dataset)]
-
-        try:
-            perplexity = math.exp(torch.mean(losses))
-        except OverflowError:
-            perplexity = float("inf")
-        logger.info(f"Done! Perplexity: {perplexity}\n")
-
-        del losses
+        # Eval for dense
+        if args.eval_dense:
+            logger.info("Eval for dense..")
+            ppl = evaluation(model, eval_dataloader)
+            logger.info(f"Done! perplexity: {ppl}\n")
 
     best_perplexity = float('inf')
 
@@ -865,6 +875,11 @@ def main():
                 del pruned_weights_dict
 
                 torch.cuda.empty_cache()
+                # We wanna see how the performance will be influenced after pruning
+                logger.info("Eval after pruned..")
+                ppl = evaluation(model, eval_dataloader)
+                logger.info("Done! perplexity: {ppl}\n")
+                torch.cuda.empty_cache()
 
                 model.train()
 
@@ -913,27 +928,10 @@ def main():
             
             # Eval every 100 update steps if model has been pruned
             if prune_counts and (step + 1) % (100 * args.gradient_accumulation_steps) == 0:
-                model.eval()
                 logger.info(f"Eval for sparse..")
+                ppl = evaluation(model, eval_dataloader)
+                logger.info(f"Done! epoch {epoch}\tstep {step + 1}\tperplexity {ppl}\n")
 
-                losses = []
-                for batch in tqdm(eval_dataloader, disable=not accelerator.is_local_main_process):
-                    with torch.no_grad():
-                        outputs = model(**batch)
-
-                    loss = outputs.loss
-                    # (num_devices*batch_size,)
-                    losses.append(accelerator.gather(loss.repeat(args.per_device_eval_batch_size)))
-                losses = torch.cat(losses)
-                losses = losses[: len(eval_dataset)]
-
-                try:
-                    perplexity = math.exp(torch.mean(losses))
-                except OverflowError:
-                    perplexity = float("inf")
-                logger.info(f"epoch: {epoch} step: {step + 1} perplexity: {perplexity}\n")
-
-                del losses
                 model.train()
 
             if isinstance(checkpointing_steps, int):
@@ -946,26 +944,9 @@ def main():
             if completed_steps >= args.max_train_steps:
                 break
 
-        model.eval()
-
-        losses = []
-        for batch in eval_dataloader:
-            with torch.no_grad():
-                outputs = model(**batch)
-
-            loss = outputs.loss
-            # (num_devices*batch_size,)
-            losses.append(accelerator.gather(loss.repeat(args.per_device_eval_batch_size)))
-        losses = torch.cat(losses)
-        losses = losses[: len(eval_dataset)]
-
-        try:
-            perplexity = math.exp(torch.mean(losses))
-        except OverflowError:
-            perplexity = float("inf")
-        logger.info(f"epoch {epoch}: perplexity: {perplexity}\n")
-
-        del losses
+        logger.info("Eval after a training epoch..")
+        perplexity = evaluation(model, eval_dataloader)
+        logger.info(f"Done! epoch {epoch}\tperplexity {perplexity}\n")
 
         if args.with_tracking:
             accelerator.log(
