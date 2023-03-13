@@ -145,6 +145,12 @@ runs
 /examples/*/*/gpt*
 /examples/*/*/*.sh
 /examples/*/*/*.log
+/examples/*/*/bloom/bloom
+/examples/*/*/bloom/exp
+/examples/*/*/bloom/fast_pruning
+/examples/*/*/bloom/sparseopt
+/examples/*/*/bloom/sparseoptimizer
+/examples/*/*/bloom/pruner
 
 # data
 /data
