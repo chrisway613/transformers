@@ -2,6 +2,7 @@
 
 LOG=${1}
 
+CUDA_VISIBLE_DEVICES=0 \
 OMP_NUM_THREADS=1 TOKENIZERS_PARALLELISM=false \
 nohup accelerate launch run_clm_no_trainer_sparse.py \
     --model_name_or_path gpt2 \
@@ -13,7 +14,7 @@ nohup accelerate launch run_clm_no_trainer_sparse.py \
     --preprocessing_num_workers 8 \
     --per_device_train_batch_size 2 \
     --per_device_eval_batch_size 2 \
-    --gradient_accumulation_steps 32 \
+    --gradient_accumulation_steps 16 \
     --learning_rate 1e-4 \
     --num_train_epochs 1 \
     --checkpointing_steps best \
@@ -22,4 +23,4 @@ nohup accelerate launch run_clm_no_trainer_sparse.py \
     --num_prune_samples 128 \
     --num_steps_per_pruning 64 \
     --sparsity_per_pruning_step 0.2 \
-    --output_dir ./gpt2-sparse-0.2x >> $LOG.log 2>&1 &
+    --output_dir ./gpt2-sparse-0.2x-cuda1 >> $LOG.log 2>&1 &

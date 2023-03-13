@@ -76,8 +76,11 @@ MODEL_CONFIG_CLASSES = list(MODEL_MAPPING.keys())
 MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
 
 # Pruning modules
-from fast_pruning.core.model_pruner import ModelPruner
-from fast_pruning.core.torch_data_collector import TorchDataCollector, restore_weight, apply_mask
+import sys
+ROOT = os.path.join(os.environ['HOME'], 'sparseopt')
+sys.path.append(ROOT)
+
+from sparseopt.pruner.bbs import Prune
 
 
 # Modules that keep dense
@@ -273,41 +276,22 @@ def parse_args():
 
     # Prune
     parser.add_argument(
-        "--prune_times",
-        type=int,
+        "--target_sparsity",
+        type=float,
         required=True,
-        help="Number of pruning times."
+        help="Target sparsity."
     )
     parser.add_argument(
-        "--num_steps_per_pruning",
+        "--num_prune_steps",
         type=int,
         required=True,
-        help="Number of steps per pruning time."
+        help="Total pruning steps."
     )
     parser.add_argument(
         "--prune_frequency",
         type=int,
         default=None,
         help="Pruning interval, counted by number of steps."
-    )
-    parser.add_argument(
-        "--num_prune_samples",
-        type=int,
-        default=512,
-        help="Number of samples used for pruning."
-    )
-    parser.add_argument(
-        "--pruner_type",
-        type=str,
-        default="obc",
-        help="The pruner type to use.",
-        choices=["obc", "gcd", "pcg"]
-    )
-    parser.add_argument(
-        "--sparsity_per_pruning_step",
-        type=float,
-        required=True,
-        help="How many parameters will become 0 by each pruning time."
     )
     parser.add_argument(
         "--kd",
@@ -737,6 +721,32 @@ def main():
         del losses
         return perplexity
 
+    # Generate prune dict
+    target_modules = ('attn.c_attn', 'attn.c_proj', 'mlp.c_fc', 'mlp.c_proj')
+
+    prune_dict = {}
+    for n, _ in unwrapped_model.named_parameters():
+        for mod in target_modules:
+            if f'{mod}.weight' in n:
+                prune_dict[n] = args.target_sparsity
+    logger.info(f"Prune dict: {prune_dict}\n")
+
+    # Pruner
+    set_up_infos = {
+        'cgb': {}.fromkeys(prune_dict.keys(), 32),
+        'dtype': {}.fromkeys(prune_dict.keys(), 'int8')
+    }
+    pruner = Prune(
+        unwrapped_model,
+        frequency=args.prune_frequency,
+        sparse_step=args.num_prune_steps,
+        group_size=64,
+        deploy_device='asic',
+        prune_dict=prune_dict,
+        restore_sparsity=True,
+        set_up_infos=set_up_infos
+    )
+
     # Only show the progress bar once on each machine.
     progress_bar = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process)
     completed_steps = 0
@@ -773,12 +783,28 @@ def main():
 
     best_perplexity = float('inf')
 
-    prune_counts, sparse_mask_dict = 0, {}
-    args.num_prune_samples = min(args.num_prune_samples, len(train_dataset))
-    args.prune_frequency = args.prune_frequency or (0.8 * len(train_dataloader) // args.prune_times)
+    def get_sparsity():
+        numel = num_zero = 0
+        layer_sparse_rate = {}
 
-    # Whether to keep mask applying to model if it was pruned.
-    keep_mask = True
+        for n, p in unwrapped_model.named_parameters():
+            if n in pruner._prune_dict:
+                numel += p.numel()
+                num_zero += (p == 0).sum().item()
+                layer_sparse_rate[n] = (p == 0.).float().mean().item()
+        total_sparse_rate = num_zero / numel if numel else 0.
+
+        return layer_sparse_rate, total_sparse_rate
+
+    # Just prune 1 step, and supervise how long the model can recover to dense.
+    pruner.prune()
+    layer_sparsities, total_sparsity = get_sparsity()
+    logger.info(f"Sparsity: {total_sparsity}")
+    logger.info(f"Layer sparsities: {layer_sparsities}\n")
+
+    logger.info("Eval after pruning..")
+    ppl = evaluation(model, eval_dataloader)
+    logger.info(f"Done! perplexity: {ppl}\n")
 
     for epoch in range(starting_epoch, args.num_train_epochs):
         model.train()
@@ -792,97 +818,6 @@ def main():
                 if resume_step is not None and step < resume_step:
                     completed_steps += 1
                     continue
-            
-            # Few-shot pruning
-            if (step + 1) % args.prune_frequency == 0 and prune_counts < args.prune_times:
-                model.eval()
-
-                prune_start = time.time()
-
-                ''' i. Register forward hook for collecting states '''
-                collector = TorchDataCollector()
-                collector.register_hook_for_layer(unwrapped_model, verbose=True)
-
-                ''' ii. Forwarding on few-shot samples in order to record states 
-                        NOTE: gradient is not required '''
-                prune_dataset = train_dataset.select(range(args.num_prune_samples))
-                prune_dataloader = DataLoader(
-                    prune_dataset,
-                    pin_memory=True, num_workers=8,
-                    collate_fn=default_data_collator,
-                    batch_size=args.per_device_eval_batch_size
-                )
-
-                logger.info(f"Prune frequency = {args.prune_frequency}")
-                logger.info(f"Num prune steps = {args.num_steps_per_pruning}")
-                logger.info(f"Num prune samples = {args.num_prune_samples}")
-
-                logger.info(f"Model forwarding on pruning data..")
-                for prune_step, prune_batch in tqdm(
-                    enumerate(prune_dataloader, start=1),
-                    disable=not accelerator.is_local_main_process
-                ):
-                    # cpu->gpu
-                    prune_batch = {k: v.to(model.device) for k, v in prune_batch.items()}
-                    with torch.no_grad():
-                        model(**prune_batch)
-                    
-                    if prune_step == args.num_steps_per_pruning:
-                        break
-                logger.info("Done!\n")
-
-                ''' iii. Pruning '''
-                logger.info("Pruning model by solver..")
-                pruner = ModelPruner(pruner=args.pruner_type)
-                # str -> numpy
-                pruned_weights_dict, sparse_mask_dict = pruner.pruning(
-                    dataset=collector.create_pruning_dataset(),
-                    target_sparsity_dict={}.fromkeys(PRUNE_IGNORES, 0.),
-                    default_sparsity=args.sparsity_per_pruning_step,
-                    finetune_freq=1, return_mask=True, verbose=False
-                )
-                logger.info("Done!\n")
-
-                ''' iv. Restore pruned weights & apply mask'''
-                logger.info("Restoring sparse weights..")
-                for name, module in unwrapped_model.named_modules():
-                    if name not in pruned_weights_dict:
-                        continue
-                        
-                    if np.sum(np.isnan(pruned_weights_dict[name])) > 0:
-                        logger.warning(f'WARN: pruned result of layer {name} contains nan, skip.')
-                        continue
-
-                    restore_weight(module, pruned_weights_dict[name])
-                    sparsity = (module.weight.abs() <= 1e-10).sum().item() / module.weight.numel()
-                    logger.info(f"layer: {name}\t sparsity: {sparsity}")
-
-                apply_mask(unwrapped_model, sparse_mask_dict)
-                logger.info("Done!\n")
-                
-                prune_counts += 1
-                prune_end = time.time()
-                prune_time = time.strftime('%Hh %Mmin %Ss', time.gmtime(prune_end - prune_start))
-                logger.info(f"Pruning time used: {prune_time}\n")
-
-                ''' v. Remove hooks and free memories'''
-                collector.remove_hooks()
-                del collector
-
-                del prune_dataset
-                del prune_dataloader
-
-                del pruner
-                del pruned_weights_dict
-
-                torch.cuda.empty_cache()
-                # We wanna see how the performance will be influenced after pruning
-                logger.info("Eval after pruned..")
-                ppl = evaluation(model, eval_dataloader)
-                logger.info(f"Done! perplexity: {ppl}\n")
-                torch.cuda.empty_cache()
-
-                model.train()
 
             if args.kd:
                 batch.update(output_attentions=True, output_hidden_states=True)
@@ -922,15 +857,16 @@ def main():
                 lr_scheduler.step()
                 optimizer.zero_grad()
 
-                if prune_counts and keep_mask:
-                    # Keep current sparsity
-                    apply_mask(unwrapped_model, sparse_mask_dict)
+                pruner.prune()
+                layer_sparsities, total_sparsity = get_sparsity()
+                logger.info(f"Sparsity: {total_sparsity}")
+                logger.info(f"Layer sparsities: {layer_sparsities}\n")
 
                 progress_bar.update(1)
                 completed_steps += 1
             
             # Eval every 100 update steps if model has been pruned
-            if prune_counts and (step + 1) % (100 * args.gradient_accumulation_steps) == 0:
+            if (step + 1) % (100 * args.gradient_accumulation_steps) == 0:
                 logger.info(f"Eval for sparse..")
                 ppl = evaluation(model, eval_dataloader)
                 logger.info(f"Done! epoch {epoch}\tstep {step + 1}\tperplexity {ppl}\n")
