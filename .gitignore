@@ -145,7 +145,7 @@ runs
 /examples/*/*/gpt*
 /examples/*/*/*.sh
 /examples/*/*/*.log
-/examples/pytorch/language-modeling/bloom/
+/examples/pytorch/language-modeling/bloom_clm/
 
 # data
 /data
