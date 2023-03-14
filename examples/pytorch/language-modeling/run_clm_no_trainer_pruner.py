@@ -330,7 +330,9 @@ def criterion_for_kd(student_outputs, teacher_outputs):
         teacher_outputs.attentions, teacher_outputs.logits
 
     # Loss for logits: soft ce loss
-    logit_loss = (F.softmax(teacher_logits, dim=-1) * -F.log_softmax(student_logits, dim=-1)).mean()
+    logit_loss = (F.softmax(teacher_logits, dim=-1) * -F.log_softmax(student_logits, dim=-1))
+    # batch mean
+    logit_loss = logit_loss.sum(dim=range(1, logit_loss.ndim)).mean()
 
     # Loss for hidden states: mse loss
     hs_loss = 0.
@@ -797,7 +799,10 @@ def main():
         return layer_sparse_rate, total_sparse_rate
 
     # Just prune 1 step, and supervise how long the model can recover to dense.
+    logger.info("Pruning..")
     pruner.prune()
+    logger.info("Done!")
+
     layer_sparsities, total_sparsity = get_sparsity()
     logger.info(f"Sparsity: {total_sparsity}")
     logger.info(f"Layer sparsities: {layer_sparsities}\n")
@@ -828,7 +833,7 @@ def main():
             if args.kd:
                 logit_loss, hs_loss, attn_loss = criterion_for_kd(outputs, teacher_outputs)
                 kd_loss = logit_loss + hs_loss + attn_loss
-                # TODO: Verity this
+                # TODO: Verify this
                 loss = outputs.loss + 1e-3 * kd_loss
             else:
                 loss = outputs.loss
@@ -858,12 +863,14 @@ def main():
                 optimizer.zero_grad()
 
                 pruner.prune()
-                layer_sparsities, total_sparsity = get_sparsity()
-                logger.info(f"Sparsity: {total_sparsity}")
-                logger.info(f"Layer sparsities: {layer_sparsities}\n")
 
                 progress_bar.update(1)
                 completed_steps += 1
+
+                if completed_steps % 1000 == 0:
+                    layer_sparsities, total_sparsity = get_sparsity()
+                    logger.info(f"Sparsity: {total_sparsity}")
+                    logger.info(f"Layer sparsities: {layer_sparsities}\n")
             
             # Eval every 100 update steps if model has been pruned
             if (step + 1) % (100 * args.gradient_accumulation_steps) == 0:

@@ -346,7 +346,9 @@ def criterion_for_kd(student_outputs, teacher_outputs):
         teacher_outputs.attentions, teacher_outputs.logits
 
     # Loss for logits: soft ce loss
-    logit_loss = (F.softmax(teacher_logits, dim=-1) * -F.log_softmax(student_logits, dim=-1)).mean()
+    logit_loss = (F.softmax(teacher_logits, dim=-1) * -F.log_softmax(student_logits, dim=-1))
+    # batch mean
+    logit_loss = logit_loss.sum(dim=range(1, logit_loss.ndim)).mean()
 
     # Loss for hidden states: mse loss
     hs_loss = 0.
@@ -775,7 +777,7 @@ def main():
 
     prune_counts, sparse_mask_dict = 0, {}
     args.num_prune_samples = min(args.num_prune_samples, len(train_dataset))
-    args.prune_frequency = args.prune_frequency or (0.8 * len(train_dataloader) // args.prune_times)
+    args.prune_frequency = args.prune_frequency or (0.8 * args.max_train_steps // args.prune_times)
 
     # Whether to keep mask applying to model if it was pruned.
     keep_mask = True
@@ -794,7 +796,7 @@ def main():
                     continue
             
             # Few-shot pruning
-            if (step + 1) % args.prune_frequency == 0 and prune_counts < args.prune_times:
+            if completed_steps % args.prune_frequency == 0 and prune_counts < args.prune_times:
                 model.eval()
 
                 prune_start = time.time()
