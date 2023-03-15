@@ -310,13 +310,11 @@ def parse_args():
     parser.add_argument(
         "--target_sparsity",
         type=float,
-        required=True,
         help="Target sparsity."
     )
     parser.add_argument(
         "--num_prune_steps",
         type=int,
-        required=True,
         help="Total pruning steps."
     )
     parser.add_argument(
@@ -777,7 +775,7 @@ def main():
         del losses
         return perplexity
 
-    if args.ckpt and args.eval_dense:
+    if args.eval_dense:
         logger.info("Eval for dense..")
         ppl = evaluation(model, eval_dataloader)
         logger.info(f"Done! perplexity: {ppl}\n")
@@ -790,10 +788,11 @@ def main():
         target_modules = ('query_key_value', 'self_attention.dense', 'mlp.dense_h_to_4h', 'mlp.dense_4h_to_h')
 
         prune_dict = {}
-        for n, _ in model.named_parameters():
+        for n, _ in unwrapped_model.named_parameters():
             for mod in target_modules:
                 if f'{mod}.weight' in n:
                     prune_dict[n] = args.target_sparsity
+        logger.info(f"Prune dict: {prune_dict}\n")
 
         set_up_infos = {
             'cgb': {}.fromkeys(prune_dict.keys(), 64),
@@ -880,30 +879,22 @@ def main():
 
                 # Checks if the accelerator has performed an optimization step behind the scenes
                 if accelerator.sync_gradients:
-                    if args.do_pruning:
-                        layer_sparsities, total_sparsity = get_sparsity()
-                        logger.info(f"Sparsity: {total_sparsity}")
-                        logger.info(f"Layer sparsities: {layer_sparsities}\n")
-
-                        if step % (100 * args.gradient_accumulation_steps) == 0:
-                            logger.info(f"Eval for sparse..")
-                            ppl = evaluation(model, eval_dataloader)
-                            logger.info(f"Done! epoch {epoch}\tstep {step + 1}\tperplexity {ppl}\n")
-
-                            model.train()
-
                     progress_bar.update(1)
                     completed_steps += 1
 
                 if isinstance(checkpointing_steps, int):
                     if completed_steps % checkpointing_steps == 0:
-                        output_dir = f"step_{completed_steps }"
+                        logger.info(f"Eval..")
+                        ppl = evaluation(model, eval_dataloader)
+                        model.train()
+                        logger.info(f"Done! epoch {epoch}\tstep {step + 1}\tperplexity {ppl}\n")
+
+                        output_dir = f"step_{completed_steps}-ppl_{ppl:.3f}"
                         if args.output_dir is not None:
                             output_dir = os.path.join(args.output_dir, output_dir)
                         accelerator.save_state(output_dir)
 
                 if step % (100 * args.gradient_accumulation_steps) == 0 or step == len(train_dataloader) - 1:
-                    # logger.info(f"Total mean loss: {total_loss / (step + 1)}, current loss: {loss.item()}")
                     logger.info(
                         f"\nEpoch[{epoch + 1}/{args.num_train_epochs}]\t"
                         f"Total mean loss {total_loss / (step + 1)}\t"
@@ -916,6 +907,17 @@ def main():
                             f"Attention loss {attn_loss}"
                         )
                     logger.info("\n")
+                
+                if args.do_pruning and step % (100 * args.gradient_accumulation_steps) == 0:
+                    layer_sparsities, total_sparsity = get_sparsity()
+                    logger.info(f"Sparsity: {total_sparsity}")
+                    logger.info(f"Layer sparsities: {layer_sparsities}\n")
+            
+                    logger.info(f"Eval for sparse..")
+                    ppl = evaluation(model, eval_dataloader)
+                    logger.info(f"Done! epoch {epoch}\tstep {step + 1}\tperplexity {ppl}\n")
+
+                    model.train()
                 
                 if completed_steps >= args.max_train_steps:
                     break

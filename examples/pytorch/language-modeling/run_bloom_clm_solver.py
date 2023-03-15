@@ -793,7 +793,7 @@ def main():
         del losses
         return perplexity
 
-    if args.ckpt and args.eval_dense:
+    if args.eval_dense:
         logger.info("Eval for dense..")
         ppl = evaluation(model, eval_dataloader)
         logger.info(f"Done! perplexity: {ppl}\n")
@@ -833,14 +833,14 @@ def main():
 
                     ''' i. Register forward hook for collecting states '''
                     collector = TorchDataCollector()
-                    collector.register_hook_for_layer(unwrapped_model, verbose=True)
+                    collector.register_hook_for_layer(unwrapped_model, excluded=PRUNE_IGNORES, verbose=True)
 
                     ''' ii. Forwarding on few-shot samples in order to record states 
                             NOTE: gradient is not required '''
                     prune_dataset = train_dataset.select(range(args.num_prune_samples))
                     prune_dataloader = DataLoader(
                         prune_dataset,
-                        pin_memory=True, num_workers=8,
+                        pin_memory=True, num_workers=4,
                         collate_fn=default_data_collator,
                         batch_size=args.per_device_eval_batch_size
                     )
@@ -944,18 +944,12 @@ def main():
 
                 # Checks if the accelerator has performed an optimization step behind the scenes
                 if accelerator.sync_gradients:
+                    progress_bar.update(1)
+                    completed_steps += 1
+
                     if prune_counts:
                         # Keep current sparsity
                         apply_mask(unwrapped_model, sparse_mask_dict)
-                        if step % (100 * args.gradient_accumulation_steps) == 0:
-                            logger.info(f"Eval for sparse..")
-                            ppl = evaluation(model, eval_dataloader)
-                            logger.info(f"Done! epoch {epoch}\tstep {step + 1}\tperplexity {ppl}\n")
-
-                            model.train()
-
-                    progress_bar.update(1)
-                    completed_steps += 1
 
                 if isinstance(checkpointing_steps, int):
                     if completed_steps % checkpointing_steps == 0:
@@ -978,6 +972,13 @@ def main():
                             f"Attention loss {attn_loss}"
                         )
                     logger.info("\n")
+                
+                if prune_counts and step % (100 * args.gradient_accumulation_steps) == 0:
+                    logger.info(f"Eval for sparse..")
+                    ppl = evaluation(model, eval_dataloader)
+                    logger.info(f"Done! epoch {epoch}\tstep {step + 1}\tperplexity {ppl}\n")
+
+                    model.train()
                 
                 if completed_steps >= args.max_train_steps:
                     break
