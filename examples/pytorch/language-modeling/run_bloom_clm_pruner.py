@@ -303,6 +303,11 @@ def parse_args():
         help="Whether to perform knowledge distillation."
     )
     parser.add_argument(
+        "--eval_dense",
+        action="store_true",
+        help="Whether to eval for dense before pruning."
+    )
+    parser.add_argument(
         "--target_sparsity",
         type=float,
         required=True,
@@ -372,7 +377,7 @@ def main():
 
     # Sending telemetry. Tracking the example usage helps us better allocate resources to maintain them. The
     # information sent is the one passed as arguments along with your Python/PyTorch versions.
-    send_example_telemetry("run_bloom_clm_no_trainer", args)
+    send_example_telemetry("run_bloom_clm_pruner", args)
 
     # Initialize the accelerator. We will let the accelerator handle device placement for us in this example.
     # If we're using tracking, we also need to initialize it here and it will by default pick up all supported trackers
@@ -496,13 +501,34 @@ def main():
     # In distributed training, the .from_pretrained methods guarantee that only one local process can concurrently
     # download model & vocab.
 
-    config = BloomConfig()
-    if args.kd:
-        config.hidden_dropout = 0.
-        config.attention_dropout = 0.
+    if args.config_name:
+        config = BloomConfig.from_pretrained(args.config_name, cache_dir=args.model_cache_dir)
+    elif args.model_name_or_path:
+        config = BloomConfig.from_pretrained(args.model_name_or_path, cache_dir=args.model_cache_dir)
+    else:
+        config = BloomConfig()
+        logger.warning("You are instantiating a new config instance from scratch.")
 
-    tokenizer = BloomTokenizerFast.from_pretrained(args.model_name_or_path, cache_dir=args.model_cache_dir)
-    model = BloomForCausalLM.from_pretrained(args.model_name_or_path, config=config, cache_dir=args.model_cache_dir)
+    if args.tokenizer_name:
+        tokenizer = BloomTokenizerFast.from_pretrained(args.tokenizer_name, cache_dir=args.model_cache_dir)
+    elif args.model_name_or_path:
+        tokenizer = BloomTokenizerFast.from_pretrained(args.model_name_or_path, cache_dir=args.model_cache_dir)
+    else:
+        raise ValueError(
+            "You are instantiating a new tokenizer from scratch. This is not supported by this script."
+            "You can do it from another script, save it, and load it from here, using --tokenizer_name."
+        )
+    
+    if args.model_name_or_path:
+        model = BloomForCausalLM.from_pretrained(
+            args.model_name_or_path,
+            from_tf=bool(".ckpt" in args.model_name_or_path),
+            config=config,
+            cache_dir=args.model_cache_dir
+        )
+    else:
+        logger.info("Training new model from scratch")
+        model = AutoModelForCausalLM.from_config(config)
     
     # We resize the embeddings only when necessary to avoid index errors. If you are creating a model from scratch
     # on a small vocab and want a smaller embedding size, remove this test.
@@ -761,7 +787,7 @@ def main():
     completed_steps = starting_epoch * num_update_steps_per_epoch
 
     if args.do_pruning:
-        target_modules = ('query_key_value', 'self_attention.dense', 'mlp.dense_h_to_4h')
+        target_modules = ('query_key_value', 'self_attention.dense', 'mlp.dense_h_to_4h', 'mlp.dense_4h_to_h')
 
         prune_dict = {}
         for n, _ in model.named_parameters():
@@ -859,6 +885,13 @@ def main():
                         logger.info(f"Sparsity: {total_sparsity}")
                         logger.info(f"Layer sparsities: {layer_sparsities}\n")
 
+                        if step % (100 * args.gradient_accumulation_steps) == 0:
+                            logger.info(f"Eval for sparse..")
+                            ppl = evaluation(model, eval_dataloader)
+                            logger.info(f"Done! epoch {epoch}\tstep {step + 1}\tperplexity {ppl}\n")
+
+                            model.train()
+
                     progress_bar.update(1)
                     completed_steps += 1
 
@@ -869,10 +902,7 @@ def main():
                             output_dir = os.path.join(args.output_dir, output_dir)
                         accelerator.save_state(output_dir)
 
-                if completed_steps >= args.max_train_steps:
-                    break
-
-                if completed_steps % (100 * args.gradient_accumulation_steps) == 0 or step == len(train_dataloader) - 1:
+                if step % (100 * args.gradient_accumulation_steps) == 0 or step == len(train_dataloader) - 1:
                     # logger.info(f"Total mean loss: {total_loss / (step + 1)}, current loss: {loss.item()}")
                     logger.info(
                         f"\nEpoch[{epoch + 1}/{args.num_train_epochs}]\t"
@@ -886,13 +916,9 @@ def main():
                             f"Attention loss {attn_loss}"
                         )
                     logger.info("\n")
-
-                if args.do_pruning and completed_steps % (100 * args.gradient_accumulation_steps) == 0:
-                    logger.info(f"Eval for sparse..")
-                    ppl = evaluation(model, eval_dataloader)
-                    logger.info(f"Done! epoch {epoch}\tstep {step + 1}\tperplexity {ppl}\n")
-
-                    model.train()
+                
+                if completed_steps >= args.max_train_steps:
+                    break
 
             logger.info("Eval after a training epoch..")
             perplexity = evaluation(model, eval_dataloader)
