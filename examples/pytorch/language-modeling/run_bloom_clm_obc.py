@@ -34,21 +34,28 @@ import random
 
 import numpy as np
 
+from typing import Dict
 from pathlib import Path
 from copy import deepcopy
 from itertools import chain
 from datetime import timedelta
 
 import datasets
+import transformers
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
+
+from tqdm.auto import tqdm
+from collections import OrderedDict
 
 from datasets import load_dataset
-from torch.utils.data import DataLoader
-from tqdm.auto import tqdm
 
-import transformers
+from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 from accelerate import Accelerator, DistributedType, InitProcessGroupKwargs
 from accelerate.logging import get_logger
@@ -70,8 +77,14 @@ from transformers.utils import check_min_version, get_full_repo_name, send_examp
 from transformers.models.bloom import BloomConfig, BloomTokenizerFast, BloomForCausalLM
 
 # Pruning modules
-from fast_pruning.core.model_pruner import ModelPruner
-from fast_pruning.core.torch_data_collector import TorchDataCollector, restore_weight, apply_mask
+# from fast_pruning.core.model_pruner import ModelPruner
+# from fast_pruning.core.torch_data_collector import TorchDataCollector, restore_weight, apply_mask
+
+import sys
+sys.path.append(os.path.join(os.environ['HOME'], 'obc', 'ddp'))
+
+from obc_solver import OBCSolver
+from torch_data_collector import TorchDataCollector
 
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
@@ -386,6 +399,90 @@ def criterion_for_kd(student_outputs, teacher_outputs):
         attn_loss = attn_loss + F.mse_loss(layer_stu_attn, layer_tea_attn)
     
     return logit_loss, hs_loss, attn_loss
+
+
+def all_gather(q, ws, device):
+    shape = q.shape
+    local_size = torch.tensor(list(shape), device=device)
+    all_sizes = [torch.zeros_like(local_size) for _ in range(ws)]
+    dist.all_gather(all_sizes, local_size)
+    new_all_sizes = [ele[0] * ele[1] for ele in all_sizes]
+    max_size = max(new_all_sizes)
+
+    size_diff = max_size.item() - (local_size[0] * local_size[1]).item()
+    q = q.view(-1)
+    if size_diff:
+        padding = torch.zeros(size_diff, device=device, dtype=q.dtype)
+        q = torch.cat((q, padding))
+
+    all_qs_padded = [torch.zeros_like(q) for _ in range(ws)]
+    dist.all_gather(all_qs_padded, q)
+
+    all_qs = []
+    for q, size, shp in zip(all_qs_padded, new_all_sizes, all_sizes):
+        all_qs.append(q[:size].view((shp[0].item(), shp[1].item())))
+        
+    return all_qs
+
+
+def restore_model_weights(network, pruned_weights):
+    if pruned_weights is not None:
+        for name, layer in network.named_modules():
+            if name not in pruned_weights or name in ('lm_head', 'model.decoder.project_out', 'model.decoder.project_in'):
+                continue
+
+            if torch.sum(torch.isnan(pruned_weights[name])) > 0:
+                print(f'Pruned result of layer {name} contains nan, skip.')
+                continue
+
+            if type(layer) == torch.nn.Linear:
+                # because torch's weight is transpose of tf's weight
+                if layer.bias is not None:
+                    layer.weight.data = pruned_weights[name][:-1, :].reshape(layer.weight.data.shape[::-1]).float().T
+                    layer.bias.data = pruned_weights[name][-1, :].float()
+                else:
+                    layer.weight.data = pruned_weights[name].reshape(layer.weight.data.shape[::-1]).float().T
+
+
+def apply_mask(module: torch.nn.Module, mask_dict: Dict[str, torch.Tensor]):
+
+    def _apply_mask_to_dense_block(layer: nn.Linear, ts_mask: torch.Tensor):
+        shape, dtype, device = layer.weight.shape, layer.weight.dtype, layer.weight.device
+
+        if layer.bias is not None:
+            bias_mask = ts_mask[-1, :].to(
+                dtype=dtype,
+                device=device,
+                non_blocking=True
+            ).detach()
+            layer.bias.data *= bias_mask
+            ts_mask = ts_mask[:-1]
+
+            del bias_mask
+        
+        ts_mask = ts_mask.reshape(shape[::-1]).T
+        weight_mask = ts_mask.to(
+            dtype=dtype,
+            device=device,
+            non_blocking=True
+        ).detach()
+        if weight_mask.shape != layer.weight.data.shape:
+            raise RuntimeError(f"shape mismatched between weight_mask({weight_mask.shape}) & layer.weight({layer.weight.shape})")
+        layer.weight.data *= weight_mask
+
+        del weight_mask
+
+    for name, layer in module.named_modules():
+        if name not in mask_dict:
+            continue
+
+        mask = mask_dict[name]
+        if isinstance(layer, nn.Linear):
+            _apply_mask_to_dense_block(layer, mask)
+        else:
+            raise TypeError(f'Unknow module type: {layer}')
+
+    return module
 
 
 def main():
@@ -809,6 +906,15 @@ def main():
         args.num_prune_samples = min(args.num_prune_samples, len(train_dataset))
         args.prune_frequency = args.prune_frequency or (0.8 * args.max_train_steps // args.prune_times)
 
+        logger.info("Initialize ddp solver..")
+        dev = accelerator.local_process_index
+        solver = OBCSolver(sparsity=args.sparsity_per_pruning_step, device=f"cuda:{dev}")
+        ddp_solver = DDP(solver, device_ids=[dev])
+        ddp_solver.eval()
+        logger.info("Done!\n")
+
+        world_size = accelerator.num_processes
+
         for epoch in range(starting_epoch, args.num_train_epochs):
             model.train()
 
@@ -826,14 +932,15 @@ def main():
                     continue
                 
                 # Few-shot pruning
-                if step % (args.prune_frequency * args.gradient_accumulation_steps) == 0 and prune_counts < args.prune_times:
+                if completed_steps % args.prune_frequency == 0 and prune_counts < args.prune_times:
                     model.eval()
 
                     prune_start = time.time()
 
                     ''' i. Register forward hook for collecting states '''
                     collector = TorchDataCollector()
-                    collector.register_hook_for_layer(unwrapped_model, excluded=PRUNE_IGNORES, verbose=True)
+                    # collector.register_hook_for_layer(unwrapped_model, excluded=PRUNE_IGNORES, verbose=True)
+                    collector.register_module(unwrapped_model, excluded=PRUNE_IGNORES, verbose=True)
 
                     ''' ii. Forwarding on few-shot samples in order to record states 
                             NOTE: gradient is not required '''
@@ -845,9 +952,10 @@ def main():
                         batch_size=args.per_device_eval_batch_size
                     )
 
+                    logger.info(f"Num prune counts = {args.prune_times}")
                     logger.info(f"Prune frequency = {args.prune_frequency}")
-                    logger.info(f"Num prune steps = {args.num_steps_per_pruning}")
                     logger.info(f"Num prune samples = {args.num_prune_samples}")
+                    logger.info(f"Num prune steps = {args.num_steps_per_pruning}")
 
                     logger.info(f"Model forwarding on pruning data..")
                     for prune_step, prune_batch in tqdm(
@@ -865,31 +973,55 @@ def main():
 
                     ''' iii. Pruning '''
                     logger.info("Pruning model by solver..")
-                    pruner = ModelPruner(pruner=args.pruner_type)
-                    # str -> numpy
-                    pruned_weights_dict, sparse_mask_dict = pruner.pruning(
-                        dataset=collector.create_pruning_dataset(),
-                        target_sparsity_dict={}.fromkeys(PRUNE_IGNORES, 0.),
-                        default_sparsity=args.sparsity_per_pruning_step,
-                        finetune_freq=1, return_mask=True, verbose=False
-                    )
-                    logger.info("Done!\n")
+
+                    statistics_dataset = collector.create_pruning_dataset()
+                    statistics_dataset.prepare()
+                    if accelerator.is_local_main_process:
+                        logger.info(f"original keys order: {statistics_dataset.original_keys_order}")
+                        logger.info(f"new keys order: {statistics_dataset.new_keys_order}")
+
+                    statistics_sampler = DistributedSampler(statistics_dataset, shuffle=False)
+                    statistics_dataloader = DataLoader(statistics_dataset, batch_size=1, sampler=statistics_sampler)
+
+                    final_outputs = {}
+                    for batch in tqdm(statistics_dataloader, disable=not accelerator.is_local_main_process):
+                        input, label = batch
+
+                        xtx = input[0].to(dev).squeeze()
+                        weight = input[1].to(dev).squeeze()
+                        label = label.to(dev)
+                        
+                        with torch.no_grad():
+                            output = ddp_solver(xtx, weight)
+                        outputs = all_gather(output, world_size, args.local_rank)
+
+                        label_outputs = [torch.zeros_like(label) for _ in range(world_size)]
+                        dist.all_gather(label_outputs, label)        
+                        
+                        for i in range(len(label_outputs)):
+                            final_outputs[label_outputs[i].item()] = outputs[i]
+                    logger.info(f"Done! raw pruned weights: {final_outputs}\n")
+                    
+                    matched_weights = {}
+                    # if args.local_rank == 0:
+                    for id in final_outputs.keys():
+                        matched_weights[statistics_dataset.id_to_key[id]] = final_outputs[id] 
+                    logger.info(f"matched_weights keys: {matched_weights.keys()}\n")
+
+                    reordered_weights = OrderedDict()
+                    # if args.local_rank == 0:
+                    for key in statistics_dataset.original_keys_order:
+                        reordered_weights[key] = matched_weights[key]
+                    logger.info(f"restored_weights keys: {reordered_weights.keys()}\n")
 
                     ''' iv. Restore pruned weights & apply mask'''
                     logger.info("Restoring sparse weights..")
-                    for name, module in unwrapped_model.named_modules():
-                        if name not in pruned_weights_dict:
-                            continue
-                            
-                        if np.sum(np.isnan(pruned_weights_dict[name])) > 0:
-                            logger.warning(f'WARN: pruned result of layer {name} contains nan, skip.')
-                            continue
-
-                        restore_weight(module, pruned_weights_dict[name])
-                        sparsity = (module.weight.abs() <= 1e-10).sum().item() / module.weight.numel()
-                        logger.info(f"layer: {name}\t sparsity: {sparsity}")
-
+                    restore_model_weights(unwrapped_model, reordered_weights)
+                    
+                    eps = 1e-10
+                    sparse_mask_dict = {k: 1. - np.less_equal(np.abs(v), eps) for k, v in reordered_weights.items()}
                     apply_mask(unwrapped_model, sparse_mask_dict)
+
                     logger.info("Done!\n")
                     
                     prune_counts += 1
@@ -904,8 +1036,12 @@ def main():
                     del prune_dataset
                     del prune_dataloader
 
-                    del pruner
-                    del pruned_weights_dict
+                    del statistics_dataset
+                    del statistics_dataloader
+
+                    del final_outputs
+                    del matched_weights
+                    del restore_weights
 
                     torch.cuda.empty_cache()
                     # We wanna see how the performance will be influenced after pruning

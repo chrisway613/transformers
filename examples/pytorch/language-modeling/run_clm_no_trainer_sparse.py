@@ -796,7 +796,7 @@ def main():
                     continue
             
             # Few-shot pruning
-            if completed_steps % args.prune_frequency == 0 and prune_counts < args.prune_times:
+            if step % (args.prune_frequency * args.gradient_accumulation_steps)== 0 and prune_counts < args.prune_times:
                 model.eval()
 
                 prune_start = time.time()
