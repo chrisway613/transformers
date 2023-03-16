@@ -932,7 +932,7 @@ def main():
                     continue
                 
                 # Few-shot pruning
-                if completed_steps % args.prune_frequency == 0 and prune_counts < args.prune_times:
+                if step % (args.prune_frequency * args.gradient_accumulation_steps) == 0 and prune_counts < args.prune_times:
                     model.eval()
 
                     prune_start = time.time()
@@ -940,7 +940,11 @@ def main():
                     ''' i. Register forward hook for collecting states '''
                     collector = TorchDataCollector()
                     # collector.register_hook_for_layer(unwrapped_model, excluded=PRUNE_IGNORES, verbose=True)
-                    collector.register_module(unwrapped_model, excluded=PRUNE_IGNORES, verbose=True)
+                    collector.register_module(
+                        unwrapped_model,
+                        excluded=PRUNE_IGNORES,
+                        verbose=accelerator.is_local_main_process
+                    )
 
                     ''' ii. Forwarding on few-shot samples in order to record states 
                             NOTE: gradient is not required '''
@@ -993,7 +997,7 @@ def main():
                         
                         with torch.no_grad():
                             output = ddp_solver(xtx, weight)
-                        outputs = all_gather(output, world_size, args.local_rank)
+                        outputs = all_gather(output, world_size, accelerator.local_process_index)
 
                         label_outputs = [torch.zeros_like(label) for _ in range(world_size)]
                         dist.all_gather(label_outputs, label)        
@@ -1017,12 +1021,11 @@ def main():
                     ''' iv. Restore pruned weights & apply mask'''
                     logger.info("Restoring sparse weights..")
                     restore_model_weights(unwrapped_model, reordered_weights)
-                    
-                    eps = 1e-10
-                    sparse_mask_dict = {k: 1. - np.less_equal(np.abs(v), eps) for k, v in reordered_weights.items()}
-                    apply_mask(unwrapped_model, sparse_mask_dict)
-
                     logger.info("Done!\n")
+
+                    eps = 1e-10
+                    sparse_mask_dict = {k: (v.abs() > eps).to(dtype=v.dtype) for k, v in reordered_weights.items()}
+                    apply_mask(unwrapped_model, sparse_mask_dict)
                     
                     prune_counts += 1
                     prune_end = time.time()
@@ -1041,7 +1044,7 @@ def main():
 
                     del final_outputs
                     del matched_weights
-                    del restore_weights
+                    del reordered_weights
 
                     torch.cuda.empty_cache()
                     # We wanna see how the performance will be influenced after pruning

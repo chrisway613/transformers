@@ -874,13 +874,13 @@ def main():
                     lr_scheduler.step()
                     optimizer.zero_grad()
 
-                    if args.do_pruning:
-                        pruner.prune()
-
                 # Checks if the accelerator has performed an optimization step behind the scenes
                 if accelerator.sync_gradients:
                     progress_bar.update(1)
                     completed_steps += 1
+
+                    if args.do_pruning:
+                        pruner.prune()
 
                 if isinstance(checkpointing_steps, int):
                     if completed_steps % checkpointing_steps == 0:
@@ -908,7 +908,7 @@ def main():
                         )
                     logger.info("\n")
                 
-                if args.do_pruning and step % (100 * args.gradient_accumulation_steps) == 0:
+                if args.do_pruning and (step + 1) % (100 * args.gradient_accumulation_steps) == 0:
                     layer_sparsities, total_sparsity = get_sparsity()
                     logger.info(f"Sparsity: {total_sparsity}")
                     logger.info(f"Layer sparsities: {layer_sparsities}\n")

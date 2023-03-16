@@ -55,7 +55,6 @@ from accelerate.logging import get_logger
 from accelerate.utils import set_seed
 from huggingface_hub import Repository
 from transformers import (
-    CONFIG_MAPPING,
     MODEL_MAPPING,
     AutoConfig,
     AutoModelForCausalLM,
@@ -324,6 +323,12 @@ def parse_args():
         default="obc",
         help="The pruner type to use.",
         choices=["obc", "gcd", "pcg"]
+    )
+    parser.add_argument(
+        "--solver_parallel",
+        type=int,
+        default=128,
+        help="Parallel size for solver, only valid when sovler type is 'obc'."
     )
     parser.add_argument(
         "--sparsity_per_pruning_step",
@@ -865,7 +870,10 @@ def main():
 
                     ''' iii. Pruning '''
                     logger.info("Pruning model by solver..")
-                    pruner = ModelPruner(pruner=args.pruner_type)
+                    pruner_args = {'pruner': args.pruner_type}
+                    if args.pruner_type == 'obc':
+                        pruner_args.update(parallel=args.solver_parallel)
+                    pruner = ModelPruner(**pruner_args)
                     # str -> numpy
                     pruned_weights_dict, sparse_mask_dict = pruner.pruning(
                         dataset=collector.create_pruning_dataset(),
