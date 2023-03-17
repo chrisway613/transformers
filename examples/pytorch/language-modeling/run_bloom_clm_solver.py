@@ -978,7 +978,7 @@ def main():
                         )
                     logger.info("\n")
                 
-                if prune_counts and step % (100 * args.gradient_accumulation_steps) == 0:
+                if prune_counts and (step + 1) % (100 * args.gradient_accumulation_steps) == 0:
                     logger.info(f"Eval for sparse..")
                     ppl = evaluation(model, eval_dataloader)
                     logger.info(f"Done! epoch {epoch}\tstep {step + 1}\tperplexity {ppl}\n")

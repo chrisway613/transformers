@@ -988,8 +988,8 @@ def main():
                     statistics_dataloader = DataLoader(statistics_dataset, batch_size=1, sampler=statistics_sampler)
 
                     final_outputs = {}
-                    for batch in tqdm(statistics_dataloader, disable=not accelerator.is_local_main_process):
-                        input, label = batch
+                    for statistics_batch in tqdm(statistics_dataloader, disable=not accelerator.is_local_main_process):
+                        input, label = statistics_batch
 
                         xtx = input[0].to(dev).squeeze()
                         weight = input[1].to(dev).squeeze()
@@ -1109,7 +1109,7 @@ def main():
                         )
                     logger.info("\n")
                 
-                if prune_counts and step % (100 * args.gradient_accumulation_steps) == 0:
+                if prune_counts and (step + 1) % (100 * args.gradient_accumulation_steps) == 0:
                     logger.info(f"Eval for sparse..")
                     ppl = evaluation(model, eval_dataloader)
                     logger.info(f"Done! epoch {epoch}\tstep {step + 1}\tperplexity {ppl}\n")
