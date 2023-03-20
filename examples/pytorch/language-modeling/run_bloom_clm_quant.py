@@ -661,8 +661,8 @@ def main():
     if args.ckpt:
         logger.info(f"Loading model checkpoint '{args.ckpt}'..")
 
-        state_dict = torch.load(args.loadckpt, map_location='cpu')
-        missing_keys, unexpected_keys = model.load_state_dict(state_dict)
+        state_dict = torch.load(args.ckpt, map_location='cpu')
+        missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
         if len(missing_keys) and accelerator.is_local_main_process:
             logger.warning(f"Missing keys: {missing_keys}")
         if len(unexpected_keys) and accelerator.is_local_main_process:
