@@ -28,6 +28,7 @@ import logging
 import math
 import os
 import glob
+import time
 import shutil
 import random
 
@@ -851,6 +852,8 @@ def main():
 
                     continue
 
+                batch_start = time.time()
+
                 with accelerator.accumulate(model):
                     if args.kd:
                         batch.update(output_attentions=True, output_hidden_states=True)
@@ -918,6 +921,9 @@ def main():
                     logger.info(f"Done! epoch {epoch}\tstep {step + 1}\tperplexity {ppl}\n")
 
                     model.train()
+                
+                batch_end = time.time()
+                logger.info(f"Batch time used: {batch_end - batch_start}s\n")
                 
                 if completed_steps >= args.max_train_steps:
                     break

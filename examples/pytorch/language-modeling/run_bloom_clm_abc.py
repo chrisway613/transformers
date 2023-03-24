@@ -32,8 +32,6 @@ import time
 import shutil
 import random
 
-import numpy as np
-
 from typing import Dict
 from pathlib import Path
 from copy import deepcopy
@@ -55,6 +53,8 @@ from datasets import load_dataset
 
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
+
+from torch.distributed import ReduceOp
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from accelerate import Accelerator, DistributedType, InitProcessGroupKwargs
@@ -75,10 +75,11 @@ from transformers.models.bloom import BloomConfig, BloomTokenizerFast, BloomForC
 
 import sys
 sys.path.append(os.path.join(os.environ['HOME'], 'obc', 'ddp'))
+sys.path.append(os.path.join(os.environ['HOME'], 'obc', 'ddp_abc'))
 
 # Pruning modules
-from obc_solver import OBCSolver
-from torch_data_collector import TorchDataCollector
+from abc_solver import ABCSolver
+from torch_data_collector import TorchDataCollector, StatRecord
 
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
@@ -308,9 +309,9 @@ def parse_args():
         help="Number of pruning times."
     )
     parser.add_argument(
-        "--num_steps_per_pruning",
+        "--max_steps_per_pruning",
         type=int,
-        required=True,
+        default=-1,
         help="Number of steps per pruning time."
     )
     parser.add_argument(
@@ -333,10 +334,11 @@ def parse_args():
         choices=["obc", "gcd", "pcg"]
     )
     parser.add_argument(
-        "--sparsity_per_pruning_step",
+        "--sparsities",
+        nargs="*",
         type=float,
         required=True,
-        help="How many parameters will become 0 by each pruning time."
+        help="Sparse rate of each pruning time."
     )
     parser.add_argument(
         "--kd",
@@ -350,6 +352,9 @@ def parse_args():
     )
 
     args = parser.parse_args()
+
+    if args.prune_times and len(args.sparsities) != args.prune_times:
+        raise ValueError(f"Number of sparsity rates ({len(args.sparsities)}) must be equal to prune times ({args.prune_times}).")
 
     # Sanity checks
     if args.dataset_name is None and args.train_file is None and args.validation_file is None:
@@ -404,7 +409,7 @@ def all_gather(q, ws, device):
     max_size = max(new_all_sizes)
 
     size_diff = max_size.item() - (local_size[0] * local_size[1]).item()
-    q = q.view(-1)
+    q = q.reshape(-1)
     if size_diff:
         padding = torch.zeros(size_diff, device=device, dtype=q.dtype)
         q = torch.cat((q, padding))
@@ -483,12 +488,19 @@ def apply_mask(module: torch.nn.Module, mask_dict: Dict[str, torch.Tensor]):
     return module
 
 
+def all_reduce(ts: torch.Tensor, op=ReduceOp.SUM, group=None, async_op=False):
+    dist.all_reduce(ts, op=op, group=group, async_op=async_op)
+    ts /= dist.get_world_size()
+    
+    return ts
+
+
 def main():
     args = parse_args()
 
     # Sending telemetry. Tracking the example usage helps us better allocate resources to maintain them. The
     # information sent is the one passed as arguments along with your Python/PyTorch versions.
-    send_example_telemetry("run_bloom_clm_solver", args)
+    send_example_telemetry("run_bloom_clm_abc_solver", args)
 
     # Initialize the accelerator. We will let the accelerator handle device placement for us in this example.
     # If we're using tracking, we also need to initialize it here and it will by default pick up all supported trackers
@@ -816,7 +828,7 @@ def main():
         experiment_config = vars(args)
         # TensorBoard cannot log Enums, need the raw value
         experiment_config["lr_scheduler_type"] = experiment_config["lr_scheduler_type"].value
-        accelerator.init_trackers("bloom_clm_no_trainer", experiment_config)
+        accelerator.init_trackers("bloom_clm_abc_solver", experiment_config)
 
     # Train!
     total_batch_size = args.per_device_train_batch_size * \
@@ -903,15 +915,8 @@ def main():
         prune_counts, sparse_mask_dict = 0, {}
         args.num_prune_samples = min(args.num_prune_samples, len(train_dataset))
         args.prune_frequency = args.prune_frequency or (0.8 * args.max_train_steps // args.prune_times)
-
         if args.prune_times:
-            logger.info("Initialize ddp solver..")
             dev = accelerator.local_process_index
-            solver = OBCSolver(sparsity=args.sparsity_per_pruning_step, device=f"cuda:{dev}")
-            ddp_solver = DDP(solver, device_ids=[dev])
-            ddp_solver.eval()
-            logger.info("Done!\n")
-
             world_size = accelerator.num_processes
 
         for epoch in range(starting_epoch, args.num_train_epochs):
@@ -936,6 +941,12 @@ def main():
 
                     prune_start = time.time()
 
+                    logger.info("Initialize ddp solver..")
+                    solver = ABCSolver(sparsity=args.sparsities[prune_counts], device=f"cuda:{dev}")
+                    ddp_solver = DDP(solver, device_ids=[dev])
+                    ddp_solver.eval()
+                    logger.info("Done!\n")
+
                     ''' i. Register forward hook for collecting states '''
                     collector = TorchDataCollector()
                     # collector.register_hook_for_layer(unwrapped_model, excluded=PRUNE_IGNORES, verbose=True)
@@ -954,11 +965,13 @@ def main():
                         collate_fn=default_data_collator,
                         batch_size=args.per_device_eval_batch_size
                     )
+                    prune_dataloader = accelerator.prepare(prune_dataloader)
 
-                    logger.info(f"Num prune counts = {args.prune_times}")
-                    logger.info(f"Prune frequency = {args.prune_frequency}")
-                    logger.info(f"Num prune samples = {args.num_prune_samples}")
-                    logger.info(f"Num prune steps = {args.num_steps_per_pruning}")
+                    logger.info(f"\nPrune frequency\t=\t{args.prune_frequency}")
+                    logger.info(f"Num prune samples\t=\t{args.num_prune_samples}")
+                    logger.info(f"Num prune steps on pruning data\t=\t{len(prune_dataloader)}")
+                    logger.info(f"Prune counts\t=\t[{prune_counts + 1}/{args.prune_times}]")
+                    logger.info(f"Target sparsity\t=\t{args.sparsities[prune_counts]}\n")
 
                     logger.info(f"Model forwarding on pruning data..")
                     for prune_step, prune_batch in tqdm(
@@ -970,9 +983,32 @@ def main():
                         with torch.no_grad():
                             model(**prune_batch)
                         
-                        if prune_step == args.num_steps_per_pruning:
+                        if prune_step == args.max_steps_per_pruning:
                             break
                     logger.info("Done!\n")
+
+                    # Sync all processes
+                    reduced_stat_record_dict = {}
+                    for op_name, record in collector.stat_record_dict.items():
+                        xtx = all_reduce(record.xtx_stat.to(device=dev)).cpu()
+                        xty = all_reduce(record.xty_stat.to(device=dev)).cpu()
+                        yty = all_reduce(record.yty_stat.to(device=dev)).cpu()
+                        normalize_term = all_reduce(record.normalize_term.to(device=dev)).cpu()
+
+                        reduced_stat_record_dict[op_name] = StatRecord(
+                            xtx_stat=xtx,
+                            yty_stat=xty,
+                            xty_stat=yty,
+                            normalize_term=normalize_term,
+                            kernel=record.kernel,
+                            bias=record.bias,
+                            shape=record.shape,
+                            w=record.w
+                        )
+                    collector.stat_record_dict.update(reduced_stat_record_dict)
+
+                    del reduced_stat_record_dict
+                    torch.cuda.empty_cache()
 
                     ''' iii. Pruning '''
                     logger.info("Pruning model by solver..")
@@ -980,8 +1016,8 @@ def main():
                     statistics_dataset = collector.create_pruning_dataset()
                     statistics_dataset.prepare()
                     # if accelerator.is_local_main_process:
-                    #     logger.info(f"original keys order: {statistics_dataset.original_keys_order}")
-                    #     logger.info(f"new keys order: {statistics_dataset.new_keys_order}")
+                        # logger.info(f"original keys order: {statistics_dataset.original_keys_order}")
+                        # logger.info(f"new keys order: {statistics_dataset.new_keys_order}")
 
                     statistics_sampler = DistributedSampler(statistics_dataset, shuffle=False)
                     statistics_dataloader = DataLoader(statistics_dataset, batch_size=1, sampler=statistics_sampler)
@@ -1031,6 +1067,8 @@ def main():
                     logger.info(f"Pruning time used: {prune_time}\n")
 
                     ''' v. Remove hooks and free memories'''
+                    del ddp_solver
+
                     collector.remove_hooks()
                     del collector
 
@@ -1095,9 +1133,10 @@ def main():
                 if step % (100 * args.gradient_accumulation_steps) == 0 or step == len(train_dataloader) - 1:
                     logger.info(
                         f"\nEpoch[{epoch + 1}/{args.num_train_epochs}]\t"
-                        f"Total mean loss {total_loss / (step + 1)}\t"
                         f"Loss {loss.item()}\tLr {optimizer.param_groups[0]['lr']}\t"
                     )
+                    if args.with_tracking:
+                        logger.info(f"Total mean loss {total_loss / (step + 1)}")
                     if args.kd:
                         logger.info(
                             f"Logit loss {logit_loss}\t"

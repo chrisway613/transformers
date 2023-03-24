@@ -32,30 +32,21 @@ import time
 import shutil
 import random
 
-import numpy as np
-
-from typing import Dict
 from pathlib import Path
 from copy import deepcopy
 from itertools import chain
 from datetime import timedelta
 
 import datasets
-import transformers
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-import torch.distributed as dist
-
-from tqdm.auto import tqdm
-from collections import OrderedDict
 
 from datasets import load_dataset
-
 from torch.utils.data import DataLoader
-from torch.utils.data.distributed import DistributedSampler
-from torch.nn.parallel import DistributedDataParallel as DDP
+from tqdm.auto import tqdm
+
+import transformers
 
 from accelerate import Accelerator, DistributedType, InitProcessGroupKwargs
 from accelerate.logging import get_logger
@@ -73,12 +64,15 @@ from transformers.utils import check_min_version, get_full_repo_name, send_examp
 
 from transformers.models.bloom import BloomConfig, BloomTokenizerFast, BloomForCausalLM
 
-import sys
-sys.path.append(os.path.join(os.environ['HOME'], 'obc', 'ddp'))
-
 # Pruning modules
-from obc_solver import OBCSolver
-from torch_data_collector import TorchDataCollector
+import sys
+sys.path.append(os.environ['HOME'])
+
+from sparseopt.sparseopt.pruner.bbs import Prune
+
+# Quant modules
+from quantopt.quantopt.core import QuantOPT
+from quantopt.quantopt.config import QuantConfig
 
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
@@ -91,8 +85,6 @@ require_version("datasets>=1.8.0",
 
 MODEL_CONFIG_CLASSES = list(MODEL_MAPPING.keys())
 MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
-
-PRUNE_IGNORES = ['lm_head']
 
 
 def parse_args():
@@ -302,41 +294,9 @@ def parse_args():
 
     # Sparse
     parser.add_argument(
-        "--prune_times",
-        type=int,
-        required=True,
-        help="Number of pruning times."
-    )
-    parser.add_argument(
-        "--num_steps_per_pruning",
-        type=int,
-        required=True,
-        help="Number of steps per pruning time."
-    )
-    parser.add_argument(
-        "--prune_frequency",
-        type=int,
-        default=None,
-        help="Pruning interval, counted by number of steps."
-    )
-    parser.add_argument(
-        "--num_prune_samples",
-        type=int,
-        default=512,
-        help="Number of samples used for pruning."
-    )
-    parser.add_argument(
-        "--pruner_type",
-        type=str,
-        default="obc",
-        help="The pruner type to use.",
-        choices=["obc", "gcd", "pcg"]
-    )
-    parser.add_argument(
-        "--sparsity_per_pruning_step",
-        type=float,
-        required=True,
-        help="How many parameters will become 0 by each pruning time."
+        "--do_pruning",
+        action="store_true",
+        help="Not finetune but do pruning.",
     )
     parser.add_argument(
         "--kd",
@@ -347,6 +307,36 @@ def parse_args():
         "--eval_dense",
         action="store_true",
         help="Whether to eval for dense before pruning."
+    )
+    parser.add_argument(
+        "--target_sparsity",
+        type=float,
+        help="Target sparsity."
+    )
+    parser.add_argument(
+        "--num_prune_steps",
+        type=int,
+        help="Total pruning steps."
+    )
+    parser.add_argument(
+        "--prune_frequency",
+        type=int,
+        default=None,
+        help="Pruning interval, counted by number of steps."
+    )
+
+    #Qat
+    parser.add_argument(
+        "--quant",
+        action="store_true",
+        help="whether to do quant aware training."
+    )
+    parser.add_argument(
+        "--quant_mode",
+        type=str,
+        default="true_quant",
+        choices=("true_quant", "fake_quant", "fp32"),
+        help="Quantization mode."
     )
 
     args = parser.parse_args()
@@ -395,100 +385,12 @@ def criterion_for_kd(student_outputs, teacher_outputs):
     return logit_loss, hs_loss, attn_loss
 
 
-def all_gather(q, ws, device):
-    shape = q.shape
-    local_size = torch.tensor(list(shape), device=device)
-    all_sizes = [torch.zeros_like(local_size) for _ in range(ws)]
-    dist.all_gather(all_sizes, local_size)
-    new_all_sizes = [ele[0] * ele[1] for ele in all_sizes]
-    max_size = max(new_all_sizes)
-
-    size_diff = max_size.item() - (local_size[0] * local_size[1]).item()
-    q = q.view(-1)
-    if size_diff:
-        padding = torch.zeros(size_diff, device=device, dtype=q.dtype)
-        q = torch.cat((q, padding))
-
-    all_qs_padded = [torch.zeros_like(q) for _ in range(ws)]
-    dist.all_gather(all_qs_padded, q)
-
-    all_qs = []
-    for q, size, shp in zip(all_qs_padded, new_all_sizes, all_sizes):
-        all_qs.append(q[:size].view((shp[0].item(), shp[1].item())))
-        
-    return all_qs
-
-
-def restore_model_weights(network, pruned_weights):
-    if pruned_weights is not None:
-        for name, layer in network.named_modules():
-            if name not in pruned_weights or name in ('lm_head', 'model.decoder.project_out', 'model.decoder.project_in'):
-                continue
-
-            if torch.sum(torch.isnan(pruned_weights[name])) > 0:
-                print(f'Pruned result of layer {name} contains nan, skip.')
-                continue
-
-            if type(layer) == torch.nn.Linear:
-                # because torch's weight is transpose of tf's weight
-                if layer.bias is not None:
-                    layer.weight.data = pruned_weights[name][:-1, :].reshape(layer.weight.data.shape[::-1]).to(dtype=layer.weight.dtype).T
-                    layer.bias.data = pruned_weights[name][-1, :].to(dtype=layer.weight.dtype)
-                else:
-                    layer.weight.data = pruned_weights[name].reshape(layer.weight.data.shape[::-1]).to(dtype=layer.weight.dtype).T
-
-
-def apply_mask(module: torch.nn.Module, mask_dict: Dict[str, torch.Tensor]):
-
-    def _apply_mask_to_dense_block(layer: nn.Linear, ts_mask: torch.Tensor):
-        shape, dtype, device = layer.weight.shape, layer.weight.dtype, layer.weight.device
-
-        if layer.bias is not None:
-            # bias_mask = ts_mask[-1, :].to(
-            #     dtype=dtype,
-            #     device=device,
-            #     non_blocking=True
-            # ).detach()
-            # layer.bias.data *= bias_mask
-            bias_mask = ts_mask[-1, :].to(dtype=dtype)
-            layer.bias.data = layer.bias.data * bias_mask
-            ts_mask = ts_mask[:-1]
-
-            del bias_mask
-        
-        ts_mask = ts_mask.reshape(shape[::-1]).T
-        # weight_mask = ts_mask.to(
-        #     dtype=dtype,
-        #     device=device,
-        #     non_blocking=True
-        # ).detach()
-        weight_mask = ts_mask.to(dtype=dtype)
-        if weight_mask.shape != layer.weight.data.shape:
-            raise RuntimeError(f"shape mismatched between weight_mask({weight_mask.shape}) & layer.weight({layer.weight.shape})")
-        # layer.weight.data *= weight_mask
-        layer.weight.data = layer.weight.data * weight_mask
-
-        del weight_mask
-
-    for name, layer in module.named_modules():
-        if name not in mask_dict:
-            continue
-
-        mask = mask_dict[name]
-        if isinstance(layer, nn.Linear):
-            _apply_mask_to_dense_block(layer, mask)
-        else:
-            raise TypeError(f'Unknow module type: {layer}')
-
-    return module
-
-
 def main():
     args = parse_args()
 
     # Sending telemetry. Tracking the example usage helps us better allocate resources to maintain them. The
     # information sent is the one passed as arguments along with your Python/PyTorch versions.
-    send_example_telemetry("run_bloom_clm_solver", args)
+    send_example_telemetry("run_bloom_clm_pruner", args)
 
     # Initialize the accelerator. We will let the accelerator handle device placement for us in this example.
     # If we're using tracking, we also need to initialize it here and it will by default pick up all supported trackers
@@ -866,7 +768,7 @@ def main():
             starting_epoch = resume_step // len(train_dataloader)
             resume_step -= starting_epoch * len(train_dataloader)
 
-    def evaluation(model, dataloader):
+    def evaluation(model, dataloader, quant: bool = False):
         model.eval()
 
         losses = []
@@ -874,7 +776,7 @@ def main():
             with torch.no_grad():
                 outputs = model(**batch)
 
-            loss = outputs.loss
+            loss = outputs.loss if not quant else outputs['loss']
             # (num_devices*batch_size,)
             losses.append(accelerator.gather(loss.repeat(args.per_device_eval_batch_size)))
         losses = torch.cat(losses)
@@ -897,22 +799,93 @@ def main():
     progress_bar.update(starting_epoch * num_update_steps_per_epoch)
     completed_steps = starting_epoch * num_update_steps_per_epoch
 
+    if args.do_pruning:
+        target_modules = ('query_key_value', 'self_attention.dense', 'mlp.dense_h_to_4h', 'mlp.dense_4h_to_h')
+
+        prune_dict = {}
+        for n, _ in unwrapped_model.named_parameters():
+            for mod in target_modules:
+                if f'{mod}.weight' in n:
+                    prune_dict[n] = args.target_sparsity
+        logger.info(f"Prune dict: {prune_dict}\n")
+
+        set_up_infos = {
+            'cgb': {}.fromkeys(prune_dict.keys(), 64),
+            'dtype': {}.fromkeys(prune_dict.keys(), 'bf16')
+        }
+        pruner = Prune(
+            unwrapped_model,
+            group_size=64,
+            deploy_device="asic",
+            prune_dict=prune_dict,
+            restore_sparsity=False,
+            set_up_infos=set_up_infos,
+            frequency=args.prune_frequency,
+            sparse_step=args.num_prune_steps,
+        )
+
+        def get_sparsity():
+            numel = num_zero = 0
+            layer_sparse_rate = {}
+
+            for n, p in unwrapped_model.named_parameters():
+                if n in pruner._prune_dict:
+                    numel += p.numel()
+                    num_zero += (p == 0).sum().item()
+                    layer_sparse_rate[n] = (p == 0.).float().mean().item()
+            total_sparse_rate = num_zero / numel if numel else 0.
+
+            return layer_sparse_rate, total_sparse_rate
+
+        # Just prune 1 step, and supervise how long the model can recover to dense.
+        pruner.prune()
+        layer_sparsities, total_sparsity = get_sparsity()
+        logger.info(f"Sparsity: {total_sparsity}")
+        logger.info(f"Layer sparsities: {layer_sparsities}\n")
+
+        logger.info("Eval after pruning..")
+        ppl = evaluation(model, eval_dataloader)
+        logger.info(f"Done! perplexity: {ppl}\n")
+
+    if args.quant:
+        quant_config = QuantConfig(
+            mode=args.quant_mode,
+            target_quant_nodes=[
+                'transformer_h_0_self_attention_query_key_value',
+                'bmm',
+                'bmm1',
+                'transformer_h_0_self_attention_dense',
+                'transformer_h_0_mlp_dense_h_to_4h',
+                'transformer_h_0_mlp_dense_4h_to_h'
+            ]  # TODO: remove this arg future, just quant 1st block currently
+        )
+        quantopt = QuantOPT(quant_config, device=accelerator.device)
+
+        calib_model = quantopt.prepare(unwrapped_model, next(iter(eval_dataloader)))
+        calib_data = quantopt.calibrate(
+            calib_model, 
+            eval_dataloader,
+            target_modules=[
+                'transformer.h.0.self_attention.query_key_value',
+                'bmm',
+                'bmm1',
+                'transformer.h.0.self_attention.dense',
+                'transformer.h.0.mlp.dense_h_to_4h',
+                'transformer.h.0.mlp.dense_4h_to_h'
+            ]  # TODO: remove this arg future, just quant 1st block currently
+        )
+
+        model = quantopt.convert(calib_model, calib_data)
+        model.to(accelerator.device)
+
+        del calib_data
+
+        logger.info("Eval quant model..")
+        ppl = evaluation(model, eval_dataloader, quant=args.quant)
+        logger.info(f"Done! perplexity: {ppl}\n")
+
     if not args.eval_only:
         best_perplexity = float('inf')
-
-        prune_counts, sparse_mask_dict = 0, {}
-        args.num_prune_samples = min(args.num_prune_samples, len(train_dataset))
-        args.prune_frequency = args.prune_frequency or (0.8 * args.max_train_steps // args.prune_times)
-
-        if args.prune_times:
-            logger.info("Initialize ddp solver..")
-            dev = accelerator.local_process_index
-            solver = OBCSolver(sparsity=args.sparsity_per_pruning_step, device=f"cuda:{dev}")
-            ddp_solver = DDP(solver, device_ids=[dev])
-            ddp_solver.eval()
-            logger.info("Done!\n")
-
-            world_size = accelerator.num_processes
 
         for epoch in range(starting_epoch, args.num_train_epochs):
             model.train()
@@ -929,129 +902,8 @@ def main():
                         completed_steps += 1
 
                     continue
-                
-                # Few-shot pruning
-                if step % (args.prune_frequency * args.gradient_accumulation_steps) == 0 and prune_counts < args.prune_times:
-                    model.eval()
 
-                    prune_start = time.time()
-
-                    ''' i. Register forward hook for collecting states '''
-                    collector = TorchDataCollector()
-                    # collector.register_hook_for_layer(unwrapped_model, excluded=PRUNE_IGNORES, verbose=True)
-                    collector.register_module(
-                        unwrapped_model,
-                        excluded=PRUNE_IGNORES,
-                        verbose=accelerator.is_local_main_process
-                    )
-
-                    ''' ii. Forwarding on few-shot samples in order to record states 
-                            NOTE: gradient is not required '''
-                    prune_dataset = train_dataset.select(range(args.num_prune_samples))
-                    prune_dataloader = DataLoader(
-                        prune_dataset,
-                        pin_memory=True, num_workers=4,
-                        collate_fn=default_data_collator,
-                        batch_size=args.per_device_eval_batch_size
-                    )
-
-                    logger.info(f"Num prune counts = {args.prune_times}")
-                    logger.info(f"Prune frequency = {args.prune_frequency}")
-                    logger.info(f"Num prune samples = {args.num_prune_samples}")
-                    logger.info(f"Num prune steps = {args.num_steps_per_pruning}")
-
-                    logger.info(f"Model forwarding on pruning data..")
-                    for prune_step, prune_batch in tqdm(
-                        enumerate(prune_dataloader, start=1),
-                        disable=not accelerator.is_local_main_process
-                    ):
-                        # cpu->gpu
-                        prune_batch = {k: v.to(model.device) for k, v in prune_batch.items()}
-                        with torch.no_grad():
-                            model(**prune_batch)
-                        
-                        if prune_step == args.num_steps_per_pruning:
-                            break
-                    logger.info("Done!\n")
-
-                    ''' iii. Pruning '''
-                    logger.info("Pruning model by solver..")
-
-                    statistics_dataset = collector.create_pruning_dataset()
-                    statistics_dataset.prepare()
-                    # if accelerator.is_local_main_process:
-                    #     logger.info(f"original keys order: {statistics_dataset.original_keys_order}")
-                    #     logger.info(f"new keys order: {statistics_dataset.new_keys_order}")
-
-                    statistics_sampler = DistributedSampler(statistics_dataset, shuffle=False)
-                    statistics_dataloader = DataLoader(statistics_dataset, batch_size=1, sampler=statistics_sampler)
-
-                    final_outputs = {}
-                    for statistics_batch in tqdm(statistics_dataloader, disable=not accelerator.is_local_main_process):
-                        input, label = statistics_batch
-
-                        xtx = input[0].to(dev).squeeze()
-                        weight = input[1].to(dev).squeeze()
-                        label = label.to(dev)
-                        
-                        with torch.no_grad():
-                            output = ddp_solver(xtx, weight)
-                        outputs = all_gather(output, world_size, accelerator.local_process_index)
-
-                        label_outputs = [torch.zeros_like(label) for _ in range(world_size)]
-                        dist.all_gather(label_outputs, label)        
-                        
-                        for i in range(len(label_outputs)):
-                            final_outputs[label_outputs[i].item()] = outputs[i]
-                    logger.info(f"Done!\n")
-                    # logger.info(f"raw pruned weights: {final_outputs}\n")
-                    
-                    matched_weights = {}
-                    for id in final_outputs.keys():
-                        matched_weights[statistics_dataset.id_to_key[id]] = final_outputs[id] 
-                    # logger.info(f"matched_weights keys: {matched_weights.keys()}\n")
-
-                    reordered_weights = OrderedDict()
-                    for key in statistics_dataset.original_keys_order:
-                        reordered_weights[key] = matched_weights[key]
-                    # logger.info(f"restored_weights keys: {reordered_weights.keys()}\n")
-
-                    ''' iv. Restore pruned weights & apply mask'''
-                    logger.info("Restoring sparse weights..")
-                    restore_model_weights(unwrapped_model, reordered_weights)
-                    logger.info("Done!\n")
-
-                    eps = 1e-10
-                    sparse_mask_dict = {k: (v.abs() > eps).to(dtype=v.dtype) for k, v in reordered_weights.items()}
-                    # apply_mask(unwrapped_model, sparse_mask_dict)
-                    
-                    prune_counts += 1
-                    prune_end = time.time()
-                    prune_time = time.strftime('%Hh %Mmin %Ss', time.gmtime(prune_end - prune_start))
-                    logger.info(f"Pruning time used: {prune_time}\n")
-
-                    ''' v. Remove hooks and free memories'''
-                    collector.remove_hooks()
-                    del collector
-
-                    del prune_dataset
-                    del prune_dataloader
-
-                    del statistics_dataset
-                    del statistics_dataloader
-
-                    del final_outputs
-                    del matched_weights
-                    del reordered_weights
-
-                    torch.cuda.empty_cache()
-                    # We wanna see how the performance will be influenced after pruning
-                    logger.info("Eval after pruned..")
-                    ppl = evaluation(model, eval_dataloader)
-                    logger.info(f"Done! perplexity: {ppl}\n")
-                    torch.cuda.empty_cache()
-
-                    model.train()
+                batch_start = time.time()
 
                 with accelerator.accumulate(model):
                     if args.kd:
@@ -1059,14 +911,14 @@ def main():
                         with torch.no_grad():
                             teacher_outputs = teacher(**batch)
                     outputs = model(**batch)
+                    loss = outputs['loss'] if args.quant else outputs.loss
 
                     if args.kd:
                         logit_loss, hs_loss, attn_loss = criterion_for_kd(outputs, teacher_outputs)
                         kd_loss = logit_loss + hs_loss + attn_loss
                         # TODO: Verity this
-                        loss = outputs.loss + 1e-3 * kd_loss
-                    else:
-                        loss = outputs.loss
+                        loss = loss + 1e-3 * kd_loss
+
                     # We keep track of the loss at each epoch
                     if args.with_tracking:
                         total_loss += loss.detach().float()
@@ -1081,13 +933,17 @@ def main():
                     progress_bar.update(1)
                     completed_steps += 1
 
-                    if prune_counts:
-                        # Keep current sparsity
-                        apply_mask(unwrapped_model, sparse_mask_dict)
+                    if args.do_pruning:
+                        pruner.prune()
 
                 if isinstance(checkpointing_steps, int):
                     if completed_steps % checkpointing_steps == 0:
-                        output_dir = f"step_{completed_steps }"
+                        logger.info(f"Eval..")
+                        ppl = evaluation(model, eval_dataloader, quant=args.quant)
+                        model.train()
+                        logger.info(f"Done! epoch {epoch}\tstep {step + 1}\tperplexity {ppl}\n")
+
+                        output_dir = f"step_{completed_steps}-ppl_{ppl:.3f}"
                         if args.output_dir is not None:
                             output_dir = os.path.join(args.output_dir, output_dir)
                         accelerator.save_state(output_dir)
@@ -1095,9 +951,10 @@ def main():
                 if step % (100 * args.gradient_accumulation_steps) == 0 or step == len(train_dataloader) - 1:
                     logger.info(
                         f"\nEpoch[{epoch + 1}/{args.num_train_epochs}]\t"
-                        f"Total mean loss {total_loss / (step + 1)}\t"
                         f"Loss {loss.item()}\tLr {optimizer.param_groups[0]['lr']}\t"
                     )
+                    if args.with_tracking:
+                        logger.info(f"Total mean loss {total_loss / (step + 1)}")
                     if args.kd:
                         logger.info(
                             f"Logit loss {logit_loss}\t"
@@ -1106,18 +963,32 @@ def main():
                         )
                     logger.info("\n")
                 
-                if prune_counts and (step + 1) % (100 * args.gradient_accumulation_steps) == 0:
+                if args.do_pruning and (step + 1) % (100 * args.gradient_accumulation_steps) == 0:
+                    layer_sparsities, total_sparsity = get_sparsity()
+                    logger.info(f"Sparsity: {total_sparsity}")
+                    logger.info(f"Layer sparsities: {layer_sparsities}\n")
+            
                     logger.info(f"Eval for sparse..")
-                    ppl = evaluation(model, eval_dataloader)
+                    ppl = evaluation(model, eval_dataloader, quant=args.quant)
                     logger.info(f"Done! epoch {epoch}\tstep {step + 1}\tperplexity {ppl}\n")
 
                     model.train()
+                
+                if (completed_steps + 1) % 1000 == 0:
+                    logger.info(f"Eval..")
+                    ppl = evaluation(model, eval_dataloader, quant=args.quant)
+                    model.train()
+                    logger.info(f"Done! epoch {epoch}\tstep {step + 1}\tperplexity {ppl}\n")
+                
+                batch_end = time.time()
+                if (step + 1) % (100 * args.gradient_accumulation_steps) == 0:
+                    logger.info(f"Batch time used: {batch_end - batch_start}s\n")
                 
                 if completed_steps >= args.max_train_steps:
                     break
 
             logger.info("Eval after a training epoch..")
-            perplexity = evaluation(model, eval_dataloader)
+            perplexity = evaluation(model, eval_dataloader, quant=args.quant)
             logger.info(f"Done! epoch {epoch}\tperplexity {perplexity}\n")
             
             # Save states when better performance acheived.  
@@ -1138,7 +1009,7 @@ def main():
                 accelerator.wait_for_everyone()
                 accelerator.save_state(output_dir)
     else:
-        perplexity = evaluation(model, eval_dataloader)
+        perplexity = evaluation(model, eval_dataloader, quant=args.quant)
         logger.info(f"Perplexity: {perplexity}\n")
 
     if args.with_tracking:
