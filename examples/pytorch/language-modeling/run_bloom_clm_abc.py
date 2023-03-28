@@ -314,12 +314,12 @@ def parse_args():
         default=-1,
         help="Number of steps per pruning time."
     )
-    parser.add_argument(
-        "--prune_frequency",
-        type=int,
-        default=None,
-        help="Pruning interval, counted by number of steps."
-    )
+    # parser.add_argument(
+    #     "--prune_frequency",
+    #     type=int,
+    #     default=None,
+    #     help="Pruning interval, counted by number of steps."
+    # )
     parser.add_argument(
         "--num_prune_samples",
         type=int,
@@ -341,6 +341,13 @@ def parse_args():
         help="Sparse rate of each pruning time."
     )
     parser.add_argument(
+        "--sparse_steps",
+        nargs="*",
+        type=int,
+        required=True,
+        help="Sparse step of each pruning rate."
+    )
+    parser.add_argument(
         "--kd",
         action="store_true",
         help="Whether to perform knowledge distillation."
@@ -353,8 +360,12 @@ def parse_args():
 
     args = parser.parse_args()
 
-    if args.prune_times and len(args.sparsities) != args.prune_times:
-        raise ValueError(f"Number of sparsity rates ({len(args.sparsities)}) must be equal to prune times ({args.prune_times}).")
+    if args.prune_times:
+        if len(args.sparsities) != args.prune_times:
+            raise ValueError(f"Number of sparsity rates ({len(args.sparsities)}) must be equal to prune times ({args.prune_times}).")
+        
+        if len(args.sparse_steps) != args.prune_times:
+            raise ValueError(f"Number of sparsity steps ({len(args.sparse_steps)}) must be equal to prune times ({args.prune_times}).")
 
     # Sanity checks
     if args.dataset_name is None and args.train_file is None and args.validation_file is None:
@@ -776,8 +787,7 @@ def main():
             "weight_decay": 0.0,
         },
     ]
-    optimizer = torch.optim.AdamW(
-        optimizer_grouped_parameters, lr=args.learning_rate)
+    optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=args.learning_rate)
 
     # Scheduler and math around the number of training steps.
     overrode_max_train_steps = False
@@ -810,12 +820,14 @@ def main():
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(
-        len(train_dataloader) / args.gradient_accumulation_steps)
+        len(train_dataloader) / args.gradient_accumulation_steps
+    )
     if overrode_max_train_steps:
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
     # Afterwards we recalculate our number of training epochs
     args.num_train_epochs = math.ceil(
-        args.max_train_steps / num_update_steps_per_epoch)
+        args.max_train_steps / num_update_steps_per_epoch
+    )
 
     # Figure out how many steps we should save the Accelerator states
     checkpointing_steps = args.checkpointing_steps
@@ -905,16 +917,12 @@ def main():
         ppl = evaluation(model, eval_dataloader)
         logger.info(f"Done! perplexity: {ppl}\n")
 
-    # update the progress_bar if load from checkpoint
-    progress_bar.update(starting_epoch * num_update_steps_per_epoch)
-    completed_steps = starting_epoch * num_update_steps_per_epoch
-
     if not args.eval_only:
         best_perplexity = float('inf')
 
         prune_counts, sparse_mask_dict = 0, {}
         args.num_prune_samples = min(args.num_prune_samples, len(train_dataset))
-        args.prune_frequency = args.prune_frequency or (0.8 * args.max_train_steps // args.prune_times)
+        # args.prune_frequency = args.prune_frequency or (0.8 * args.max_train_steps // args.prune_times)
         if args.prune_times:
             dev = accelerator.local_process_index
             world_size = accelerator.num_processes
@@ -936,7 +944,11 @@ def main():
                     continue
                 
                 # Few-shot pruning
-                if step % (args.prune_frequency * args.gradient_accumulation_steps) == 0 and prune_counts < args.prune_times:
+                # TODO: for test
+                # if step % (args.prune_frequency * args.gradient_accumulation_steps) == 0 and prune_counts < args.prune_times:
+                # if completed_steps % args.prune_frequency == 0 and prune_counts < args.prune_times:
+                if prune_counts < args.prune_times and \
+                    (args.sparse_steps[prune_counts] == 0 or completed_steps % args.sparse_steps[prune_counts] == 0):
                     model.eval()
 
                     prune_start = time.time()
@@ -967,7 +979,7 @@ def main():
                     )
                     prune_dataloader = accelerator.prepare(prune_dataloader)
 
-                    logger.info(f"\nPrune frequency\t=\t{args.prune_frequency}")
+                    # logger.info(f"\nPrune frequency\t=\t{args.prune_frequency}")
                     logger.info(f"Num prune samples\t=\t{args.num_prune_samples}")
                     logger.info(f"Num prune steps on pruning data\t=\t{len(prune_dataloader)}")
                     logger.info(f"Prune counts\t=\t[{prune_counts + 1}/{args.prune_times}]")

@@ -795,10 +795,6 @@ def main():
         ppl = evaluation(model, eval_dataloader)
         logger.info(f"Done! perplexity: {ppl}\n")
 
-    # update the progress_bar if load from checkpoint
-    progress_bar.update(starting_epoch * num_update_steps_per_epoch)
-    completed_steps = starting_epoch * num_update_steps_per_epoch
-
     if args.do_pruning:
         target_modules = ('query_key_value', 'self_attention.dense', 'mlp.dense_h_to_4h', 'mlp.dense_4h_to_h')
 

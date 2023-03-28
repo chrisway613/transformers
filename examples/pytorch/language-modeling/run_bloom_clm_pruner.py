@@ -28,7 +28,6 @@ import logging
 import math
 import os
 import glob
-import time
 import shutil
 import random
 
@@ -753,6 +752,10 @@ def main():
                 "step_", "")) * args.gradient_accumulation_steps
             starting_epoch = resume_step // len(train_dataloader)
             resume_step -= starting_epoch * len(train_dataloader)
+        
+        # update the progress_bar if load from checkpoint
+        progress_bar.update(starting_epoch * num_update_steps_per_epoch)
+        completed_steps = starting_epoch * num_update_steps_per_epoch
 
     def evaluation(model, dataloader):
         model.eval()
@@ -780,10 +783,6 @@ def main():
         logger.info("Eval for dense..")
         ppl = evaluation(model, eval_dataloader)
         logger.info(f"Done! perplexity: {ppl}\n")
-
-    # update the progress_bar if load from checkpoint
-    progress_bar.update(starting_epoch * num_update_steps_per_epoch)
-    completed_steps = starting_epoch * num_update_steps_per_epoch
 
     if args.do_pruning:
         target_modules = ('query_key_value', 'self_attention.dense', 'mlp.dense_h_to_4h', 'mlp.dense_4h_to_h')
@@ -852,8 +851,6 @@ def main():
 
                     continue
 
-                batch_start = time.time()
-
                 with accelerator.accumulate(model):
                     if args.kd:
                         batch.update(output_attentions=True, output_hidden_states=True)
@@ -900,9 +897,12 @@ def main():
                 if step % (100 * args.gradient_accumulation_steps) == 0 or step == len(train_dataloader) - 1:
                     logger.info(
                         f"\nEpoch[{epoch + 1}/{args.num_train_epochs}]\t"
-                        f"Total mean loss {total_loss / (step + 1)}\t"
-                        f"Loss {loss.item()}\tLr {optimizer.param_groups[0]['lr']}\t"
+                        f"Loss {loss.item()}\tLr {optimizer.param_groups[0]['lr']}"
                     )
+
+                    if args.with_tracking:
+                        logger.info(f"Total mean loss {total_loss / (step + 1)}")
+
                     if args.kd:
                         logger.info(
                             f"Logit loss {logit_loss}\t"
@@ -922,8 +922,12 @@ def main():
 
                     model.train()
                 
-                batch_end = time.time()
-                logger.info(f"Batch time used: {batch_end - batch_start}s\n")
+                if args.eval_frequency and completed_steps % args.eval_frequency == 0:
+                    logger.info(f"Eval..")
+                    ppl = evaluation(model, eval_dataloader)
+                    logger.info(f"Done! epoch {epoch}\tstep {step + 1}\tperplexity {ppl}\n")
+
+                    model.train()
                 
                 if completed_steps >= args.max_train_steps:
                     break
