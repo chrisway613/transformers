@@ -238,6 +238,12 @@ def parse_args():
         default=None,
         help="Whether or not to use mixed precision training. Choose from 'no','fp16','bf16 or 'fp8'."
     )
+    parser.add_argument(
+        "--eval_frequency",
+        type=int,
+        default=None,
+        help="Do evaluation when meet specified number of steps."
+    )
 
     # Global
     parser.add_argument("--output_dir", type=str, default=None,
