@@ -32,6 +32,8 @@ import time
 import shutil
 import random
 
+import numpy as np
+
 from typing import Dict
 from pathlib import Path
 from copy import deepcopy
@@ -54,32 +56,39 @@ from datasets import load_dataset
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
-from torch.distributed import ReduceOp
+from torch.nn.modules import conv
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.nn.parameter import Parameter, UninitializedParameter
 
 from accelerate import Accelerator, DistributedType, InitProcessGroupKwargs
 from accelerate.logging import get_logger
 from accelerate.utils import set_seed
 from huggingface_hub import Repository
 from transformers import (
+    CONFIG_MAPPING,
     MODEL_MAPPING,
+    AutoConfig,
     AutoModelForCausalLM,
+    AutoTokenizer,
     SchedulerType,
     default_data_collator,
     get_scheduler,
 )
+from transformers.pytorch_utils import Conv1D
 from transformers.utils.versions import require_version
 from transformers.utils import check_min_version, get_full_repo_name, send_example_telemetry
 
 from transformers.models.bloom import BloomConfig, BloomTokenizerFast, BloomForCausalLM
 
+# Pruning modules
+# from fast_pruning.core.model_pruner import ModelPruner
+# from fast_pruning.core.torch_data_collector import TorchDataCollector, restore_weight, apply_mask
+
 import sys
 sys.path.append(os.path.join(os.environ['HOME'], 'obc', 'ddp'))
-sys.path.append(os.path.join(os.environ['HOME'], 'obc', 'ddp_abc'))
 
-# Pruning modules
-from abc_solver import ABCSolver
-from torch_data_collector import TorchDataCollector, StatRecord
+from obc_solver import OBCSolver
+from torch_data_collector import TorchDataCollector
 
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
@@ -93,7 +102,68 @@ require_version("datasets>=1.8.0",
 MODEL_CONFIG_CLASSES = list(MODEL_MAPPING.keys())
 MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
 
+MP_NAME = "_m_name"
+MASK_COLLECTOR = {}
 PRUNE_IGNORES = ['lm_head']
+
+
+class WeightMask:
+    name: str
+
+    def __init__(self, name: str="weight") -> None:
+        self.name = name
+
+    # TODO: make return type more specific
+    def compute_weight(self, module):
+        d = getattr(module, self.name + '_d')
+        m = getattr(module, self.name + '_m')
+
+        return d * m
+
+    @staticmethod
+    def apply(module, name: str = "weight") -> 'WeightMask':
+        for _, hook in module._forward_pre_hooks.items():
+            if isinstance(hook, WeightMask) and hook.name == name:
+                raise RuntimeError("Cannot register two weight_mask hooks on the same parameter {}".format(name))
+
+        fn = WeightMask(name)
+
+        if not hasattr(module, name):
+            return
+
+        weight = getattr(module, name)
+        if isinstance(weight, UninitializedParameter):
+            raise ValueError(
+                'The module passed to `WeightMask` can\'t have uninitialized parameters. '
+                'Make sure to run a dummy forwarding process before applying weight mask'
+            )
+        # remove w from parameter list
+        del module._parameters[name]
+
+        # add d and m as new parameters and express w as d * m
+        w_data, w_mask = weight, torch.ones_like(weight)
+        module.register_parameter(name + '_d', w_data)
+        module.register_buffer(name + '_m', w_mask)
+        setattr(module, name, fn.compute_weight(module))
+
+        # recompute weight before every forward()
+        module.register_forward_pre_hook(fn)
+        # record the mask information
+        if hasattr(module, MP_NAME):
+            MASK_COLLECTOR[getattr(module, MP_NAME)] = w_mask
+
+        return fn
+
+    def remove(self, module) -> None:
+        weight = self.compute_weight(module)
+        delattr(module, self.name)
+        del module._parameters[self.name + '_d']
+        del module._buffers[self.name + '_m']
+
+        setattr(module, self.name, Parameter(weight.data))
+
+    def __call__(self, module, inputs) -> None:
+        setattr(module, self.name, self.compute_weight(module))
 
 
 def parse_args():
@@ -309,17 +379,17 @@ def parse_args():
         help="Number of pruning times."
     )
     parser.add_argument(
-        "--max_steps_per_pruning",
+        "--num_steps_per_pruning",
         type=int,
-        default=-1,
+        required=True,
         help="Number of steps per pruning time."
     )
-    # parser.add_argument(
-    #     "--prune_frequency",
-    #     type=int,
-    #     default=None,
-    #     help="Pruning interval, counted by number of steps."
-    # )
+    parser.add_argument(
+        "--prune_frequency",
+        type=int,
+        default=None,
+        help="Pruning interval, counted by number of steps."
+    )
     parser.add_argument(
         "--num_prune_samples",
         type=int,
@@ -334,18 +404,10 @@ def parse_args():
         choices=["obc", "gcd", "pcg"]
     )
     parser.add_argument(
-        "--sparsities",
-        nargs="*",
+        "--sparsity_per_pruning_step",
         type=float,
         required=True,
-        help="Sparse rate of each pruning time."
-    )
-    parser.add_argument(
-        "--sparse_steps",
-        nargs="*",
-        type=int,
-        required=True,
-        help="Sparse step of each pruning rate."
+        help="How many parameters will become 0 by each pruning time."
     )
     parser.add_argument(
         "--kd",
@@ -359,13 +421,6 @@ def parse_args():
     )
 
     args = parser.parse_args()
-
-    if args.prune_times:
-        if len(args.sparsities) != args.prune_times:
-            raise ValueError(f"Number of sparsity rates ({len(args.sparsities)}) must be equal to prune times ({args.prune_times}).")
-        
-        if len(args.sparse_steps) != args.prune_times:
-            raise ValueError(f"Number of sparsity steps ({len(args.sparse_steps)}) must be equal to prune times ({args.prune_times}).")
 
     # Sanity checks
     if args.dataset_name is None and args.train_file is None and args.validation_file is None:
@@ -420,7 +475,7 @@ def all_gather(q, ws, device):
     max_size = max(new_all_sizes)
 
     size_diff = max_size.item() - (local_size[0] * local_size[1]).item()
-    q = q.reshape(-1)
+    q = q.view(-1)
     if size_diff:
         padding = torch.zeros(size_diff, device=device, dtype=q.dtype)
         q = torch.cat((q, padding))
@@ -452,58 +507,55 @@ def restore_model_weights(network, pruned_weights):
                     layer.bias.data = pruned_weights[name][-1, :].to(dtype=layer.weight.dtype)
                 else:
                     layer.weight.data = pruned_weights[name].reshape(layer.weight.data.shape[::-1]).to(dtype=layer.weight.dtype).T
+                
+                sparsity = (layer.weight.abs() <= 1e-10).sum().item() / layer.weight.numel()
+                logger.info(f"layer: {name}\t sparsity: {sparsity}")
 
 
-def apply_mask(module: torch.nn.Module, mask_dict: Dict[str, torch.Tensor]):
-
-    def _apply_mask_to_dense_block(layer: nn.Linear, ts_mask: torch.Tensor):
-        shape, dtype, device = layer.weight.shape, layer.weight.dtype, layer.weight.device
-
-        if layer.bias is not None:
-            # bias_mask = ts_mask[-1, :].to(
-            #     dtype=dtype,
-            #     device=device,
-            #     non_blocking=True
-            # ).detach()
-            # layer.bias.data *= bias_mask
-            bias_mask = ts_mask[-1, :].to(dtype=dtype)
-            layer.bias.data = layer.bias.data * bias_mask
-            ts_mask = ts_mask[:-1]
-
-            del bias_mask
-        
-        ts_mask = ts_mask.reshape(shape[::-1]).T
-        # weight_mask = ts_mask.to(
-        #     dtype=dtype,
-        #     device=device,
-        #     non_blocking=True
-        # ).detach()
-        weight_mask = ts_mask.to(dtype=dtype)
-        if weight_mask.shape != layer.weight.data.shape:
-            raise RuntimeError(f"shape mismatched between weight_mask({weight_mask.shape}) & layer.weight({layer.weight.shape})")
-        # layer.weight.data *= weight_mask
-        layer.weight.data = layer.weight.data * weight_mask
-
-        del weight_mask
-
-    for name, layer in module.named_modules():
-        if name not in mask_dict:
-            continue
-
-        mask = mask_dict[name]
-        if isinstance(layer, nn.Linear):
-            _apply_mask_to_dense_block(layer, mask)
-        else:
-            raise TypeError(f'Unknow module type: {layer}')
-
-    return module
+def feed_mask(mask_dict: Dict[str, float]):
+    for name, mask in mask_dict.items():
+        MASK_COLLECTOR[name].data = mask
 
 
-def all_reduce(ts: torch.Tensor, op=ReduceOp.SUM, group=None, async_op=False):
-    dist.all_reduce(ts, op=op, group=group, async_op=async_op)
-    ts /= dist.get_world_size()
+def need_mask(name, module):
+    return isinstance(module, (nn.Linear, conv._ConvNd, Conv1D)) and name not in PRUNE_IGNORES
+
+
+def remove_weight_mask(module, name: str = 'weight'):
+    r"""Removes the weight mask reparameterization from a module.
+
+    Args:
+        module (Module): containing module
+        name (str, optional): name of weight parameter
+
+    Example:
+        >>> m = weight_mask(nn.Linear(20, 40))
+        >>> remove_weight_mask(m)
+    """
+
+    for k, hook in module._forward_pre_hooks.items():
+        if isinstance(hook, WeightMask) and hook.name == name:
+            hook.remove(module)
+            del module._forward_pre_hooks[k]
+
+            # remove the mask information
+            if hasattr(module, MP_NAME) and getattr(module, MP_NAME) in MASK_COLLECTOR:
+                MASK_COLLECTOR.pop(getattr(module, MP_NAME))
+
+            return module
+
+    raise ValueError("weight_mask of '{}' not found in {}".format(name, module))
     
-    return ts
+
+def name_model(module):
+    for name, submodule in module.named_modules():
+        setattr(submodule, MP_NAME, name)
+
+
+def remove_name_model(module):
+    for _, submodule in module.named_modules():
+        if hasattr(submodule, MP_NAME):
+            delattr(submodule, MP_NAME)
 
 
 def main():
@@ -511,7 +563,7 @@ def main():
 
     # Sending telemetry. Tracking the example usage helps us better allocate resources to maintain them. The
     # information sent is the one passed as arguments along with your Python/PyTorch versions.
-    send_example_telemetry("run_bloom_clm_abc_solver", args)
+    send_example_telemetry("run_bloom_clm_solver", args)
 
     # Initialize the accelerator. We will let the accelerator handle device placement for us in this example.
     # If we're using tracking, we also need to initialize it here and it will by default pick up all supported trackers
@@ -624,8 +676,7 @@ def main():
                 split=f"train[{args.validation_split_percentage}%:]",
                 **dataset_args,
             )
-    raw_datasets['train'] = raw_datasets['train']
-    # TODO: Remember 1000 samples selected here
+    raw_datasets['train'] = raw_datasets['train']#.select(range(1000))
     raw_datasets['validation'] = raw_datasets['validation'].select(range(1000))
 
     # See more about loading any type of standard or custom dataset (from files, python dict, pandas DataFrame, etc) at
@@ -788,11 +839,13 @@ def main():
             "weight_decay": 0.0,
         },
     ]
-    optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=args.learning_rate)
+    optimizer = torch.optim.AdamW(
+        optimizer_grouped_parameters, lr=args.learning_rate)
 
     # Scheduler and math around the number of training steps.
     overrode_max_train_steps = False
-    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+    num_update_steps_per_epoch = math.ceil(
+        len(train_dataloader) / args.gradient_accumulation_steps)
     if args.max_train_steps is None:
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
         overrode_max_train_steps = True
@@ -820,14 +873,12 @@ def main():
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(
-        len(train_dataloader) / args.gradient_accumulation_steps
-    )
+        len(train_dataloader) / args.gradient_accumulation_steps)
     if overrode_max_train_steps:
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
     # Afterwards we recalculate our number of training epochs
     args.num_train_epochs = math.ceil(
-        args.max_train_steps / num_update_steps_per_epoch
-    )
+        args.max_train_steps / num_update_steps_per_epoch)
 
     # Figure out how many steps we should save the Accelerator states
     checkpointing_steps = args.checkpointing_steps
@@ -840,7 +891,7 @@ def main():
         experiment_config = vars(args)
         # TensorBoard cannot log Enums, need the raw value
         experiment_config["lr_scheduler_type"] = experiment_config["lr_scheduler_type"].value
-        accelerator.init_trackers("bloom_clm_abc_solver", experiment_config)
+        accelerator.init_trackers("bloom_clm_no_trainer", experiment_config)
 
     # Train!
     total_batch_size = args.per_device_train_batch_size * \
@@ -917,15 +968,38 @@ def main():
         ppl = evaluation(model, eval_dataloader)
         logger.info(f"Done! perplexity: {ppl}\n")
 
+    # update the progress_bar if load from checkpoint
+    progress_bar.update(starting_epoch * num_update_steps_per_epoch)
+    completed_steps = starting_epoch * num_update_steps_per_epoch
+
     if not args.eval_only:
         best_perplexity = float('inf')
 
-        prune_counts, sparse_mask_dict = 0, {}
+        prune_counts = 0
         args.num_prune_samples = min(args.num_prune_samples, len(train_dataset))
-        # args.prune_frequency = args.prune_frequency or (0.8 * args.max_train_steps // args.prune_times)
-        if args.prune_times:
-            dev = accelerator.local_process_index
-            world_size = accelerator.num_processes
+        args.prune_frequency = args.prune_frequency or (0.8 * args.max_train_steps // args.prune_times)
+
+        logger.info("Initialize ddp solver..")
+        dev = accelerator.local_process_index
+        solver = OBCSolver(sparsity=args.sparsity_per_pruning_step, device=f"cuda:{dev}")
+        ddp_solver = DDP(solver, device_ids=[dev])
+        ddp_solver.eval()
+        logger.info("Done!\n")
+
+        world_size = accelerator.num_processes
+
+        # Register forward pre hook for masked weights
+        name_model(unwrapped_model)
+        for n, m in unwrapped_model.named_modules():
+            if need_mask(n, m):
+                WeightMask.apply(m)
+                logger.info(f"Mask hook for {n}({type(m)}) has been registered.")
+        logger.info(f"Layers in MASK_COLLECTOR: {MASK_COLLECTOR.keys()}\n")
+
+        def show_sparsity(model):
+            for name, layer in model.named_modules():
+                sparsity = (layer.weight.abs() <= 1e-10).sum().item() / layer.weight.numel()
+                logger.info(f"layer: {name}\t sparsity: {sparsity}")
 
         for epoch in range(starting_epoch, args.num_train_epochs):
             model.train()
@@ -944,20 +1018,10 @@ def main():
                     continue
                 
                 # Few-shot pruning
-                # TODO: for test
-                # if step % (args.prune_frequency * args.gradient_accumulation_steps) == 0 and prune_counts < args.prune_times:
-                # if completed_steps % args.prune_frequency == 0 and prune_counts < args.prune_times:
-                if prune_counts < args.prune_times and \
-                    (args.sparse_steps[prune_counts] == 0 or completed_steps % args.sparse_steps[prune_counts] == 0):
+                if step % (args.prune_frequency * args.gradient_accumulation_steps) == 0 and prune_counts < args.prune_times:
                     model.eval()
 
                     prune_start = time.time()
-
-                    logger.info("Initialize ddp solver..")
-                    solver = ABCSolver(sparsity=args.sparsities[prune_counts], device=f"cuda:{dev}")
-                    ddp_solver = DDP(solver, device_ids=[dev])
-                    ddp_solver.eval()
-                    logger.info("Done!\n")
 
                     ''' i. Register forward hook for collecting states '''
                     collector = TorchDataCollector()
@@ -977,13 +1041,11 @@ def main():
                         collate_fn=default_data_collator,
                         batch_size=args.per_device_eval_batch_size
                     )
-                    prune_dataloader = accelerator.prepare(prune_dataloader)
 
-                    # logger.info(f"\nPrune frequency\t=\t{args.prune_frequency}")
-                    logger.info(f"Num prune samples\t=\t{args.num_prune_samples}")
-                    logger.info(f"Num prune steps on pruning data\t=\t{len(prune_dataloader)}")
-                    logger.info(f"Prune counts\t=\t[{prune_counts + 1}/{args.prune_times}]")
-                    logger.info(f"Target sparsity\t=\t{args.sparsities[prune_counts]}\n")
+                    logger.info(f"Num prune counts = {args.prune_times}")
+                    logger.info(f"Prune frequency = {args.prune_frequency}")
+                    logger.info(f"Num prune samples = {args.num_prune_samples}")
+                    logger.info(f"Num prune steps = {args.num_steps_per_pruning}")
 
                     logger.info(f"Model forwarding on pruning data..")
                     for prune_step, prune_batch in tqdm(
@@ -995,41 +1057,18 @@ def main():
                         with torch.no_grad():
                             model(**prune_batch)
                         
-                        if prune_step == args.max_steps_per_pruning:
+                        if prune_step == args.num_steps_per_pruning:
                             break
                     logger.info("Done!\n")
-
-                    # Sync all processes
-                    reduced_stat_record_dict = {}
-                    for op_name, record in collector.stat_record_dict.items():
-                        xtx = all_reduce(record.xtx_stat.to(device=dev)).cpu()
-                        xty = all_reduce(record.xty_stat.to(device=dev)).cpu()
-                        yty = all_reduce(record.yty_stat.to(device=dev)).cpu()
-                        normalize_term = all_reduce(record.normalize_term.to(device=dev)).cpu()
-
-                        reduced_stat_record_dict[op_name] = StatRecord(
-                            xtx_stat=xtx,
-                            yty_stat=xty,
-                            xty_stat=yty,
-                            normalize_term=normalize_term,
-                            kernel=record.kernel,
-                            bias=record.bias,
-                            shape=record.shape,
-                            w=record.w
-                        )
-                    collector.stat_record_dict.update(reduced_stat_record_dict)
-
-                    del reduced_stat_record_dict
-                    torch.cuda.empty_cache()
 
                     ''' iii. Pruning '''
                     logger.info("Pruning model by solver..")
 
                     statistics_dataset = collector.create_pruning_dataset()
                     statistics_dataset.prepare()
-                    # if accelerator.is_local_main_process:
-                        # logger.info(f"original keys order: {statistics_dataset.original_keys_order}")
-                        # logger.info(f"new keys order: {statistics_dataset.new_keys_order}")
+                    if accelerator.is_local_main_process:
+                        logger.info(f"original keys order: {statistics_dataset.original_keys_order}")
+                        logger.info(f"new keys order: {statistics_dataset.new_keys_order}")
 
                     statistics_sampler = DistributedSampler(statistics_dataset, shuffle=False)
                     statistics_dataloader = DataLoader(statistics_dataset, batch_size=1, sampler=statistics_sampler)
@@ -1051,18 +1090,17 @@ def main():
                         
                         for i in range(len(label_outputs)):
                             final_outputs[label_outputs[i].item()] = outputs[i]
-                    logger.info(f"Done!\n")
-                    # logger.info(f"raw pruned weights: {final_outputs}\n")
+                    logger.info(f"Done! raw pruned weights: {final_outputs}\n")
                     
                     matched_weights = {}
                     for id in final_outputs.keys():
                         matched_weights[statistics_dataset.id_to_key[id]] = final_outputs[id] 
-                    # logger.info(f"matched_weights keys: {matched_weights.keys()}\n")
+                    logger.info(f"matched_weights keys: {matched_weights.keys()}\n")
 
                     reordered_weights = OrderedDict()
                     for key in statistics_dataset.original_keys_order:
                         reordered_weights[key] = matched_weights[key]
-                    # logger.info(f"restored_weights keys: {reordered_weights.keys()}\n")
+                    logger.info(f"restored_weights keys: {reordered_weights.keys()}\n")
 
                     ''' iv. Restore pruned weights & apply mask'''
                     logger.info("Restoring sparse weights..")
@@ -1071,7 +1109,7 @@ def main():
 
                     eps = 1e-10
                     sparse_mask_dict = {k: (v.abs() > eps).to(dtype=v.dtype) for k, v in reordered_weights.items()}
-                    # apply_mask(unwrapped_model, sparse_mask_dict)
+                    feed_mask(sparse_mask_dict)
                     
                     prune_counts += 1
                     prune_end = time.time()
@@ -1079,8 +1117,6 @@ def main():
                     logger.info(f"Pruning time used: {prune_time}\n")
 
                     ''' v. Remove hooks and free memories'''
-                    del ddp_solver
-
                     collector.remove_hooks()
                     del collector
 
@@ -1131,10 +1167,6 @@ def main():
                     progress_bar.update(1)
                     completed_steps += 1
 
-                    if prune_counts:
-                        # Keep current sparsity
-                        apply_mask(unwrapped_model, sparse_mask_dict)
-
                 if isinstance(checkpointing_steps, int):
                     if completed_steps % checkpointing_steps == 0:
                         output_dir = f"step_{completed_steps }"
@@ -1145,10 +1177,9 @@ def main():
                 if step % (100 * args.gradient_accumulation_steps) == 0 or step == len(train_dataloader) - 1:
                     logger.info(
                         f"\nEpoch[{epoch + 1}/{args.num_train_epochs}]\t"
+                        f"Total mean loss {total_loss / (step + 1)}\t"
                         f"Loss {loss.item()}\tLr {optimizer.param_groups[0]['lr']}\t"
                     )
-                    if args.with_tracking:
-                        logger.info(f"Total mean loss {total_loss / (step + 1)}")
                     if args.kd:
                         logger.info(
                             f"Logit loss {logit_loss}\t"
@@ -1163,6 +1194,9 @@ def main():
                     logger.info(f"Done! epoch {epoch}\tstep {step + 1}\tperplexity {ppl}\n")
 
                     model.train()
+                
+                if prune_counts and (step + 1) % 2000 == 0:
+                    show_sparsity(unwrapped_model)
                 
                 if completed_steps >= args.max_train_steps:
                     break
@@ -1188,6 +1222,12 @@ def main():
                         
                 accelerator.wait_for_everyone()
                 accelerator.save_state(output_dir)
+        
+        # Un-register forward pre hook for masked weights
+        for n, m in unwrapped_model.named_modules():
+            if need_mask(n, m):
+                remove_weight_mask(m)
+        remove_name_model(unwrapped_model)
     else:
         perplexity = evaluation(model, eval_dataloader)
         logger.info(f"Perplexity: {perplexity}\n")
